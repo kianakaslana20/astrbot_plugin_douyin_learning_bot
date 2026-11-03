@@ -10,6 +10,7 @@ AstrBot：>=4.29.1,<5（本机 4.29.3 实测）
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import re
 import subprocess
@@ -85,6 +86,7 @@ HELP_TEXT = """/dy            状态与用法
 /dy calib      抓 40 条样本，看当前阈值下会学哪些、过筛率多少
 /dy dom im|share|comment|both  抓对应面板的真实结构（登录后校准用）
 /dy kb [n]     看最近 n 条知识库
+/dy cookie     看抖音 cookie 状态（到期时间、保活）；/dy cookie import edge 从本机浏览器借登录态
 /dy update     检查 GitHub 上有没有新版本（apply 直接拉取）
 /dy stop       关掉浏览器，释放内存"""
 
@@ -124,6 +126,10 @@ SUB_ALIASES = {
     "检查更新": "update",
     "升级": "update",
     "版本": "update",
+    "cookie": "cookie",
+    "cookies": "cookie",
+    "登录态": "cookie",
+    "ck": "cookie",
 }
 
 
@@ -325,15 +331,46 @@ class DouyinLearningBot(Star):
     def _active_profile(self) -> str:
         return str(self._read_state().get("active_profile") or "default")
 
-    def _profile_path(self, name: str | None = None) -> Path:
-        """一个 profile 目录 = 一套 cookie/设备指纹 = 一个抖音号。"""
+    def _chan_tag(self) -> str:
+        """内核标签：不同内核的 profile 不能混用（实测 Edge 读 chromium 写的库会直接崩）。"""
+        chan = (getattr(self.settings, "channel", "") or "").strip().lower()
+        return {"": "chromium", "msedge": "msedge", "chrome": "chrome"}.get(chan, chan or "chromium")
+
+    def _profile_base(self, name: str | None = None) -> Path:
+        """一个号一份基目录（不带内核标签）。"""
         name = name or self._active_profile()
         if name == "default":
             legacy = self.data_dir / "browser_profile"
-            # 兼容升级前的那份 profile，别把现有登录状态弄丢
             if legacy.exists() and not (self._profile_root() / "default").exists():
                 return legacy
         return self._profile_root() / name
+
+    def _profile_path(self, name: str | None = None) -> Path:
+        """真正给 Playwright 用的目录 = 基目录 / 内核标签。
+
+        为什么要按内核分：Chromium 和 Edge 写的 profile 数据结构不完全兼容，
+        实测拿 chromium 写出来的目录去启 Edge 会以 0xC0000409/STATUS_BREAKPOINT
+        直接崩（TargetClosedError）。分开存，再在切换时把 cookie 搬过去。
+        """
+        return self._profile_base(name) / self._chan_tag()
+
+    def _migration_plan(self) -> tuple[Path, Path] | None:
+        """新内核目录里还没有登录态、别处有 → 需要把 cookie 搬一次。
+
+        注意判定用「有没有 sessionid」，不是「目录空不空」：Edge 起过一次就已经
+        写了一堆文件，但里面没有登录态，那种情况也要搬。
+        """
+        base = self._profile_base()
+        target = base / self._chan_tag()
+        if self._has_session(target):
+            return None
+        for sub in ("chromium", "msedge", "chrome"):
+            cand = base / sub
+            if cand != target and self._has_session(cand):
+                return cand, target
+        if self._has_session(base):
+            return base, target          # 升级前的老布局
+        return None
 
     def _list_profiles(self) -> list[tuple[str, Path, bool, str]]:
         """列出所有 profile：(名字, 路径, 有没有登录态, 最后修改时间)。"""
@@ -342,13 +379,22 @@ class DouyinLearningBot(Star):
         legacy = self.data_dir / "browser_profile"
         if legacy.exists():
             seen.add("default")
-            out.append(("default", legacy, self._has_session(legacy), self._mtime(legacy)))
+            out.append(("default", legacy, self._session_in(legacy), self._mtime(legacy)))
         root = self._profile_root()
         for d in sorted(root.iterdir()) if root.exists() else []:
-            if not d.is_dir() or d.name in seen:
+            if not d.is_dir() or d.name in seen or d.name in {"chromium", "msedge", "chrome"}:
                 continue
-            out.append((d.name, d, self._has_session(d), self._mtime(d)))
+            out.append((d.name, d, self._session_in(d), self._mtime(d)))
         return out
+
+    def _session_in(self, base: Path) -> bool:
+        """基目录（或它下面任一内核子目录）里有没有登录态。"""
+        if self._has_session(base):
+            return True
+        for sub in ("chromium", "msedge", "chrome"):
+            if self._has_session(base / sub):
+                return True
+        return False
 
     @staticmethod
     def _mtime(p: Path) -> str:
@@ -465,6 +511,72 @@ class DouyinLearningBot(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("推送消息失败（%s）：%s", umo, exc)
 
+    async def _migrate_kernel_profile(self) -> None:
+        """换内核（比如 chromium → Edge）后，把老目录里的 cookie 搬到新目录。
+
+        两个内核的 profile 结构不兼容（用 chromium 的目录启 Edge 会 STATUS_BREAKPOINT 崩溃），
+        所以只能新建目录 + 把登录态搬过去。搬不成就当没登录，走扫码——不会让整轮失败。
+        """
+        if getattr(self, "_migrate_tried", False):
+            return
+        plan = self._migration_plan()
+        if not plan:
+            return
+        self._migrate_tried = True
+        old, new = plan
+        tag = old.name.lower()
+        src_chan = tag if tag in {"msedge", "chrome"} else ""
+        logger.info("换内核：把 %s（%s）里的登录态搬到 %s", old, src_chan or "chromium", new)
+        snap = None
+        try:
+            snap = dataclasses.replace(
+                self.settings, channel=src_chan, quiet_window=True, headless=False
+            )
+            src = DouyinBrowser(snap, old)
+            await src._ensure()          # 不起上下文就没有 cookie 可读（raw_cookies 会回空）
+            all_cookies = await src.raw_cookies()
+            cookies = [c for c in all_cookies if "douyin" in (c.get("domain") or "")] or all_cookies
+            await src.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读老 profile 的 cookie 失败（跳过迁移）：%s", exc)
+            new.mkdir(parents=True, exist_ok=True)
+            return
+        if not cookies:
+            logger.info("老 profile 里没有 cookie，迁移跳过")
+            new.mkdir(parents=True, exist_ok=True)
+            return
+        try:
+            new.mkdir(parents=True, exist_ok=True)
+            dst = DouyinBrowser(self.settings, new)
+            await dst._ensure()          # 用新内核把目录建起来
+            await dst._ctx.add_cookies(cookies)
+            await dst.close()
+            logger.info("已搬 %d 个 cookie 到 %s（下次直接用，不用扫码）", len(cookies), new)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("把 cookie 写进新内核目录失败：%s", exc)
+            new.mkdir(parents=True, exist_ok=True)
+
+    async def _try_borrow_cookies(self, job: Job | None = None) -> bool:
+        """profile 没登录时，试着从本机 Edge/Chrome 借一次抖音 cookie。
+
+        只在 cookie_source 允许时做（auto/edge/chrome）。借不到就静默返回 False，
+        交给扫码流程——绝不让"借不到"变成一个新错误。
+        """
+        source = (getattr(self.settings, "cookie_source", "auto") or "auto").lower()
+        if source == "profile":
+            return False
+        order = ["edge"] if source == "edge" else (["chrome"] if source == "chrome" else ["edge", "chrome"])
+        for name in order:
+            try:
+                n = await self.browser.import_cookies(name)
+                if await self.browser.logged_in():
+                    logger.info("已从 %s 借到登录态（%d 个 cookie），不用扫码", name, n)
+                    return True
+                logger.warning("从 %s 搬了 %d 个 cookie，但 session 已失效", name, n)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("从 %s 借 cookie 不成功：%s", name, exc)
+        return False
+
     async def _ensure_login(self, job: Job) -> bool:
         """后台跑之前确认登录态；没登录就主动叫用户扫码（发二维码截图 + 等待）。"""
         try:
@@ -474,6 +586,10 @@ class DouyinLearningBot(Star):
                 return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("检查登录态失败：%s", exc)
+
+        # profile 里没有登录态：先看能不能从本机浏览器直接借一次（用户不用扫码）
+        if await self._try_borrow_cookies(job):
+            return True
 
         if not self.settings.notify_login:
             job.error = "抖音没登录（notify_login 关着，所以没叫你）"
@@ -561,8 +677,14 @@ class DouyinLearningBot(Star):
         if not self.settings.enabled:
             job.error = "插件总开关是关的（配置里 enabled=false）"
             return None
+        await self._migrate_kernel_profile()
         if not await self._ensure_login(job):
             return None
+        # 顺手保活：让站点自己续 ttwid / msToken / bd-ticket-guard，别等它悄悄过期
+        try:
+            await self.browser.keepalive()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保活失败（不影响这一轮）：%s", exc)
         if self.settings.notify_start:
             await self._notify_text(job.umo, f"开始在后台刷这一轮（任务 #{job.id}）…")
         self.pipeline.on_stage = lambda text: self.jobs.set_stage(job, text)
@@ -768,6 +890,65 @@ class DouyinLearningBot(Star):
             return -3, f"git {' '.join(args)} 超过 {timeout}s 没回来"
         except Exception as exc:  # noqa: BLE001
             return -1, str(exc)
+
+    async def _cookie_text(self, args: list[str]) -> str:
+        """`/dy cookie`：现在这套 cookie 什么状态；`/dy cookie import edge` 真去借一次。"""
+        act = (args[0].lower() if args else "").strip()
+        if act in {"import", "借", "导入", "edge", "chrome"}:
+            name = act if act in {"edge", "chrome"} else (args[1].lower() if len(args) > 1 else "edge")
+            try:
+                n = await self.browser.import_cookies(name)
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    f"从 {name} 借 cookie 没成：{exc}\n"
+                    "（Edge/Chrome 开着的时候库被独占，先把浏览器完全退出再试；"
+                    "新版本浏览器的 cookie 用了 App-Bound 加密也解不开——那就扫码）"
+                )
+            ok = await self.browser.logged_in()
+            who = getattr(self.browser, "_who", {}) or {}
+            if ok:
+                return (
+                    f"从 {name} 搬了 {n} 个 cookie，复核通过：{who.get('nick') or '（没拿到昵称）'}\n"
+                    "以后不用再扫码了，这些 cookie 已经落在这个 profile 里。"
+                )
+            return (
+                f"从 {name} 搬了 {n} 个 cookie，但抖音说这个 session 已经失效。\n"
+                f"发 /dy login 重新扫一次码。"
+            )
+
+        info = await self.browser.session_info()
+        ident = await self.browser.whoami()
+        lines = ["抖音 cookie 状态："]
+        lines.append(
+            "  登录态：" + ("有效" if ident else ("有 sessionid 但已被拒" if info["has_session"] else "没有 sessionid"))
+        )
+        if ident:
+            lines.append(f"  身份：{ident.get('nick')}（uid {ident.get('uid')}）")
+        if info["has_session"]:
+            lines.append(f"  sessionid：{info['sessionid_len']} 字符")
+        if info["expires_at"]:
+            left = info["expires_in_h"]
+            lines.append(f"  sid_guard 到期：还剩 {left} 小时" if left > 0 else f"  sid_guard 已到期（{-left} 小时前）")
+        lines.append(
+            f"  ttwid：{'有' if info['ttwid'] else '没有'}"
+            f"｜csrf：{'有' if info['csrf'] else '没有'}"
+        )
+        lines.append(f"  内核：{info['channel'] or '还没起浏览器'}")
+        if info["checked_at"]:
+            lines.append(f"  上次向抖音复核：{time.strftime('%H:%M:%S', time.localtime(info['checked_at']))}")
+        if info["keepalive_at"]:
+            lines.append(f"  上次保活：{time.strftime('%H:%M:%S', time.localtime(info['keepalive_at']))}")
+        gap = int(getattr(self.settings, "cookie_keepalive_min", 0) or 0)
+        lines.append(
+            f"  保活间隔：{str(gap) + ' 分钟' if gap else '关着（cookie 只能靠自然访问续命）'}"
+            f"｜借 cookie：{self.settings.cookie_source}"
+        )
+        lines.append(
+            "\n说明：评论/点赞/分享用的就是这套 cookie，它由页面自己下发、"
+            "存在 profile 里，不需要你手工粘任何东西。失效时会自动叫你扫码。"
+        )
+        lines.append("想把本机浏览器里的登录态直接搬过来：/dy cookie import edge")
+        return "\n".join(lines)
 
     async def _update_text(self, apply: bool = False) -> str:
         if not (self._plugin_dir / ".git").exists():
@@ -1296,6 +1477,10 @@ class DouyinLearningBot(Star):
             yield event.plain_result(
                 "后台队列已停、浏览器已关闭（恢复：/dy loop on 或 /dy start）"
             )
+            return
+
+        if sub in {"cookie", "cookies", "登录态", "ck"}:
+            yield event.plain_result(await self._cookie_text(args[1:]))
             return
 
         if sub in {"update", "upgrade"}:
