@@ -74,6 +74,67 @@ class Social:
         self._browser = browser
         self.settings = settings
         self.dump_dir = Path(dump_dir)
+        # 昵称 → uid 的缓存：@ 人只需要 uid，而 uid 只能从分享面板里刮。
+        # 面板只在视频详情页有，且要 hover 才展开 —— 每发一条评论去开一次视频页
+        # 又慢又容易被「打不开的视频」卡住。刮到一次就存下来。
+        self._uid_file = self.dump_dir / "uid_cache.json"
+        self._uid_cache: dict[str, str] = self._load_uid_cache()
+        # 界面发表时顺带把 publish 的回包接住 —— UI 拿不到 cid，但浏览器自己的
+        # XHR 里带着 cid。接住它，事后才能删（自测、回滚都要）。
+        self._cid_hook: list[str] = []
+        self._hook_page = None
+
+    # ---------- 昵称 → uid 缓存 ----------
+
+    def _load_uid_cache(self) -> dict[str, str]:
+        try:
+            if self._uid_file.exists():
+                data = json.loads(self._uid_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items() if k and v}
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[social] uid 缓存读不出来（{exc}），当空的用")
+        return {}
+
+    def _remember_uids(self, rows: list[dict]) -> None:
+        added = 0
+        for row in rows or []:
+            name = (row.get("name") or row.get("label") or "").strip()
+            uid = str(row.get("uid") or "").strip()
+            if name and uid and self._uid_cache.get(name) != uid:
+                self._uid_cache[name] = uid
+                added += 1
+        if not added:
+            return
+        try:
+            self.dump_dir.mkdir(parents=True, exist_ok=True)
+            self._uid_file.write_text(
+                json.dumps(self._uid_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            logger.info(f"[social] 记住 {added} 个 uid（共 {len(self._uid_cache)} 个）")
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[social] uid 缓存写不进去：{exc}")
+
+    def _uid_of(self, name: str) -> str:
+        """精确 → 包含 → 被包含，跟面板按片段匹配昵称的思路一致。"""
+        name = (name or "").strip()
+        if not name:
+            return ""
+        if name in self._uid_cache:
+            return self._uid_cache[name]
+        for key, uid in self._uid_cache.items():
+            if name in key or key in name:
+                return uid
+        return ""
+
+    async def resolve_uid(self, page, name: str) -> str:
+        """先查缓存；没有就去视频页 hover 分享面板刮一次。"""
+        uid = self._uid_of(name)
+        if uid:
+            return uid
+        rows = await self._share_rows(page)
+        self._remember_uids(rows)
+        return self._uid_of(name)
 
     # ---------- 基础工具 ----------
 
@@ -218,26 +279,47 @@ class Social:
         return {"png": str(png), "html": str(html)}
 
     async def _open_video(self, page, aweme_id: str) -> bool:
-        try:
-            await page.goto(
-                VIDEO_URL.format(aweme_id=aweme_id),
-                wait_until="domcontentloaded",
-                timeout=self._timeout_s() * 1000,
-            )
-            # 详情页会自动连播下一条（实测从「第2集」跳到「第3集」），
-            # 播放一换 aweme_id 就变了，后面所有接口调用全会打到别的视频上。
-            await page.wait_for_timeout(1500)
-            await page.evaluate(
-                """() => {
-                  const v = document.querySelector('video');
-                  if (v) { try { v.pause(); v.autoplay = false; } catch (e) {} }
-                  return true;
-                }"""
-            )
-            return True
-        except Exception as exc:
-            logger.info(f"[social] 打开视频页失败：{exc}")
-            return False
+        """打开详情页并确认「真的打开了」。
+
+        feed 里挑出来的卡片不都能开：直播卡、已下架、带货页打开后是
+        `data-e2e="error-page"`，播放器控件和分享面板全都没有，后面所有
+        DOM 操作都会以「找不到元素」告终。所以这里先验页面，再试备用入口。
+        """
+        urls = (
+            VIDEO_URL.format(aweme_id=aweme_id),
+            f"https://www.douyin.com/discover?modal_id={aweme_id}",
+            VIDEO_URL.format(aweme_id=aweme_id),   # 详情页偶发白屏，同一个 URL 再来一次
+        )
+        opened_js = """() => {
+          const err = document.querySelector('[data-e2e="error-page"]');
+          const v = document.querySelector('video');
+          if (!v) return { ok: false, why: err ? 'error-page' : '没有播放器' };
+          if (err && !(v.videoWidth > 0)) return { ok: false, why: 'error-page' };
+          return { ok: true, why: '' };
+        }"""
+        for url in urls:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_s() * 1000)
+                # 详情页会自动连播下一条（实测从「第2集」跳到「第3集」），
+                # 播放一换 aweme_id 就变了，后面所有接口调用全会打到别的视频上。
+                await page.wait_for_timeout(2400)
+                got = await page.evaluate(opened_js) or {}
+                if not got.get("ok"):
+                    logger.info(
+                        "[social] %s 打不开（%s），换下一个入口", aweme_id, got.get("why") or "?"
+                    )
+                    continue
+                await page.evaluate(
+                    """() => {
+                      const v = document.querySelector('video');
+                      if (v) { try { v.pause(); v.autoplay = false; } catch (e) {} }
+                      return true;
+                    }"""
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.info(f"[social] 打开视频页失败：{exc}")
+        return False
 
     # ---------- 评论（接口） ----------
 
@@ -504,10 +586,15 @@ class Social:
                 """(panel) => {
                        const c = document.querySelector(panel);
                        if (!c) return [];
-                       return Array.from(c.querySelectorAll('[data-userid]')).map((a) => ({
-                           uid: a.getAttribute('data-userid'),
-                           name: (a.parentElement ? a.parentElement.innerText : '').replace(/\\s+/g, ' ').trim(),
-                           label: (a.innerText || '').trim()}));
+                       return Array.from(c.querySelectorAll('[data-userid]')).map((a) => {
+                           const raw = (a.parentElement ? a.parentElement.innerText : '').replace(/\\s+/g, ' ').trim();
+                           const label = (a.innerText || '').trim();
+                           let name = raw;
+                           if (label && label !== raw && raw.includes(label)) {
+                               name = raw.split(label).join(' ').replace(/\\s+/g, ' ').trim();
+                           }
+                           return {uid: a.getAttribute('data-userid'), name: name, label: label};
+                       });
                    }""",
                 SHARE_PANEL,
             ) or []
@@ -518,30 +605,48 @@ class Social:
             await page.mouse.move(30, 500, steps=4)
         except Exception:  # noqa: BLE001
             pass
+        if rows:                      # 刮到就存，下次 @ 不用再开面板
+            self._remember_uids(rows)
         return rows
 
     async def _api_comment_with_at(
         self, page, aweme_id: str, text: str, mentions: list[str]
     ) -> tuple[bool, str, str]:
         """接口发评论 + text_extra 带上 @。回 cid，可回读、可删除。"""
-        rows = await self._share_rows(page)
-        if not rows:
-            return False, "", "分享面板没展开，拿不到好友 uid"
+        pairs: list[tuple[str, str]] = []
+        missing: list[str] = []
+        for name in mentions:
+            uid = self._uid_of(name)
+            if uid:
+                pairs.append((name, uid))
+            else:
+                missing.append(name)
+        if missing:  # 缓存里没有才去开面板刮，且刮到就存起来
+            rows = await self._share_rows(page)
+            self._remember_uids(rows)
+            for name in list(missing):
+                uid = self._uid_of(name)
+                if uid:
+                    pairs.append((name, uid))
+                    missing.remove(name)
+        if not pairs:
+            return False, "", f"拿不到这些人的 uid（{', '.join(missing) or '菜单空'}）"
         body = text.rstrip()
         extra: list[dict] = []
         used: list[str] = []
-        for name in mentions:
-            hit = next((r for r in rows if name and name in (r.get("name") or "")), None)
-            if not hit or not hit.get("uid"):
-                continue
-            seg = f" @{name}"
-            body += seg
-            start = len(body) - len(seg) + 1        # 指向「@」这一格
+        for name, uid in pairs:
+            seg = f"@{name}"
+            if seg in body:
+                # 文案里自己写了 @昵称：用它的位置，别再叠一个
+                start = body.index(seg)
+            else:
+                body += " " + seg
+                start = len(body) - len(seg)
             extra.append(
                 {
                     "start": start,
                     "end": start + len(name) + 1,
-                    "user_id": str(hit["uid"]),
+                    "user_id": uid,
                     "type": 0,
                     "hashtag_name": "",
                     "hashtag_id": "",
@@ -550,7 +655,7 @@ class Social:
             )
             used.append(name)
         if not used:
-            return False, "", "分享面板里没有这些昵称，拿不到 uid"
+            return False, "", "这些昵称没解析到 uid"
         ok, cid, why = await self._comment_api(
             page, aweme_id, body, json.dumps(extra, ensure_ascii=False)
         )
@@ -771,30 +876,40 @@ class Social:
             return ActionResult(False, "comment", "评论", "未登录：先 /dy login 扫码")
 
         page = await self._page()
-        if not await self._open_video(page, aweme_id):
-            return ActionResult(False, "comment", "评论", "打开视频页失败")
 
         # 不带 @ 的时候直接走接口：确定性最好（回 cid），也不会被自动连播带走。
         if not mentions:
             ok, cid, why = await self._comment_api(page, aweme_id, text)
             if ok:
                 return ActionResult(True, "comment", "评论", f"已发布（cid={cid}），确实在评论区里")
+            await self._open_video(page, aweme_id)      # 失败也把现场留一份
             await self._dump(page, "comment-api-fail")
             return ActionResult(False, "comment", "评论", f"接口发布失败：{why}")
 
         # 带 @ 的也先走接口：能拿 cid（可回读、可删），@ 由 text_extra 表达，
         # 实测服务端会把 sec_uid 补全。界面那条路留着兜底。
-        ok_api, cid_api, why_api = await self._api_comment_with_at(page, aweme_id, text, mentions)
-        if ok_api:
-            return ActionResult(
-                True,
-                "comment",
-                "评论",
-                f"已发布（cid={cid_api}）；@ 已带上（{', '.join(mentions)}）",
+        # uid 已经在缓存里就不用开视频页了 —— 少一次导航，也绕开「打不开的视频」。
+        if all(self._uid_of(m) for m in mentions):
+            ok_api, cid_api, why_api = await self._api_comment_with_at(
+                page, aweme_id, text, mentions
             )
+            if ok_api:
+                return ActionResult(
+                    True,
+                    "comment",
+                    "评论",
+                    f"已发布（cid={cid_api}）；@ 已带上（{', '.join(mentions)}）",
+                )
+        else:
+            why_api = "uid 还没缓存，需要开视频页刮分享面板"
         logger.info("[social] 接口带@失败（%s），退回界面路径", why_api)
         if not await self._open_video(page, aweme_id):
-            return ActionResult(False, "comment", "评论", f"接口与界面都没发成：{why_api}")
+            return ActionResult(
+                False,
+                "comment",
+                "评论",
+                f"这条视频打不开（可能下架／直播卡／带货页），换下一条；接口带@也没成：{why_api}",
+            )
         await page.evaluate(
             "() => { const v = document.querySelector('video'); if (v) { v.pause(); v.autoplay = false; } }"
         )
@@ -858,6 +973,8 @@ class Social:
             await self._dump(page, "comment-at-fail", (AT_BOX, DRAFT_ANY))
 
         # 4) 发送
+        self._arm_publish_hook(page)
+        self._cid_hook.clear()
         sent = await self._click_send(page)
         await page.wait_for_timeout(1800)
         try:
@@ -867,6 +984,10 @@ class Social:
         ok = sent and not left
         detail = "已发送" if ok else ("点不到发送按钮" if not sent else "编辑器没清空，可能被拦了")
         why = await self._blocked_reason(page)
+        if why and not ok:
+            # 二次验证（second-verify-mask）跟滑块一样要人来点一下，
+            # 抛给上层走「搬窗口 + 叫人」那条路，别只回一句失败。
+            raise HumanVerifyNeeded(f"发评论被要求二次验证（{why}）")
         if why:
             if ok:
                 detail = f"已发送；但抖音弹了二次验证（{why}），建议在浏览器窗口里过一次，否则后面可能被拦"
@@ -878,11 +999,38 @@ class Social:
             detail += f"；@ 没找到：{', '.join(at_fail)}"
         if not ok:
             await self._dump(page, "comment-send-fail", (DRAFT_ANY, AT_BOX))
-        else:  # 界面发表拿不到 cid，认回来才能事后删（自测/回滚要用）
-            cid = await self._find_my_comment(page, aweme_id, text)
+        else:  # 界面发表本身拿不到 cid：先看回包钩子，再回读评论区
+            cid = self._cid_hook.pop() if self._cid_hook else ""
+            if not cid:
+                cid = await self._find_my_comment(page, aweme_id, text)
             if cid:
                 detail += f"（cid={cid}）"
         return ActionResult(ok, "comment", "评论", detail)
+
+    def _arm_publish_hook(self, page) -> None:
+        """给页面挂一个 publish 回包监听，把 cid 捡起来。"""
+        if getattr(self, "_hook_page", None) is page:
+            return
+        self._hook_page = page
+
+        async def _on_response(resp):
+            try:
+                if "/comment/publish" not in resp.url:
+                    return
+                data = await resp.json()
+                cid = str(((data or {}).get("comment") or {}).get("cid") or "")
+                if cid:
+                    self._cid_hook.append(cid)
+                    logger.info(f"[social] 抓到评论回包（cid={cid}）")
+                else:
+                    logger.info(f"[social] 评论回包没 cid：{str(data)[:150]}")
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            page.on("response", _on_response)
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[social] 挂不上评论回包监听：{exc}")
 
     async def _pick_mention(self, page, name: str) -> bool:
         """在 `.atBox-inner-container` 候选里点中昵称。候选是横向卡片，靠后的会滚出可视区。"""
