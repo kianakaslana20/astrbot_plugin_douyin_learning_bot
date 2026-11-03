@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +85,7 @@ HELP_TEXT = """/dy            状态与用法
 /dy calib      抓 40 条样本，看当前阈值下会学哪些、过筛率多少
 /dy dom im|share|comment|both  抓对应面板的真实结构（登录后校准用）
 /dy kb [n]     看最近 n 条知识库
+/dy update     检查 GitHub 上有没有新版本（apply 直接拉取）
 /dy stop       关掉浏览器，释放内存"""
 
 SUB_ALIASES = {
@@ -118,6 +120,10 @@ SUB_ALIASES = {
     "停止": "stop",
     "关闭": "stop",
     "重载": "reload",
+    "更新": "update",
+    "检查更新": "update",
+    "升级": "update",
+    "版本": "update",
 }
 
 
@@ -728,6 +734,107 @@ class DouyinLearningBot(Star):
             return ""
         return "\n\n写操作回执：\n" + "\n".join(lines)
 
+    # ------------------------------------------------------------- 版本与更新
+
+    @property
+    def _plugin_dir(self) -> Path:
+        return Path(__file__).resolve().parent
+
+    @staticmethod
+    def _read_version(text: str) -> str:
+        m = re.search(r"^version:\s*['\"]?([0-9][0-9A-Za-z.\-]*)", text, re.M)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _ver_key(v: str) -> tuple:
+        parts = re.split(r"[.\-+]", v or "")
+        out = []
+        for p in parts:
+            out.append(int(p) if p.isdigit() else 0)
+        return tuple(out) or (0,)
+
+    def _git(self, *args: str, timeout: int = 30) -> tuple[int, str]:
+        """在插件目录跑一条 git 命令，返回 (returncode, 输出)。不抛异常。"""
+        try:
+            p = subprocess.run(
+                ["git", "-C", str(self._plugin_dir), *args],
+                capture_output=True, text=True, timeout=timeout,
+                encoding="utf-8", errors="replace",
+            )
+            return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+        except FileNotFoundError:
+            return -2, "这台机器上没有 git"
+        except subprocess.TimeoutExpired:
+            return -3, f"git {' '.join(args)} 超过 {timeout}s 没回来"
+        except Exception as exc:  # noqa: BLE001
+            return -1, str(exc)
+
+    async def _update_text(self, apply: bool = False) -> str:
+        if not (self._plugin_dir / ".git").exists():
+            return (
+                "这个插件目录不是 git 克隆（多半是解压 zip 装的），没法自动比对版本。\n"
+                "要看更新：git clone https://github.com/kianakaslana20/"
+                "astrbot_plugin_douyin_learning_bot.git 换掉这个目录，"
+                "以后 /dy update 就能用了。"
+            )
+        local = ""
+        try:
+            local = self._read_version(
+                (self._plugin_dir / "metadata.yaml").read_text(encoding="utf-8")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读本地版本失败：%s", exc)
+
+        code, out = await asyncio.to_thread(self._git, "fetch", "--tags", "origin")
+        if code != 0:
+            return f"取远端失败（git fetch）：{out[:400]}\n网络问题的话稍后再试。"
+
+        code, remote_meta = await asyncio.to_thread(
+            self._git, "show", "origin/main:metadata.yaml"
+        )
+        remote = self._read_version(remote_meta) if code == 0 else ""
+        if not remote:
+            return f"取不到远端版本号。git show 的输出：{remote_meta[:300]}"
+
+        head_n = self._ver_key(local)
+        remote_n = self._ver_key(remote)
+        behind_code, behind = await asyncio.to_thread(
+            self._git, "log", "--oneline", "--no-decorate", "HEAD..origin/main"
+        )
+        commits = [ln for ln in behind.splitlines() if ln.strip()] if behind_code == 0 else []
+
+        if remote_n <= head_n and not commits:
+            return f"已经是最新的（本地 {local}，远端 {remote}）。"
+
+        lines = [f"本地 {local} → 远端 {remote}"]
+        if commits:
+            lines.append(f"落后的提交 {len(commits)} 个：")
+            lines += [f"　· {c}" for c in commits[:8]]
+            if len(commits) > 8:
+                lines.append(f"　· …还有 {len(commits) - 8} 个")
+
+        if not apply:
+            lines.append("")
+            lines.append("要更新：/dy update apply（会 git pull，之后重载插件生效）")
+            return "\n".join(lines)
+
+        pull_code, pull_out = await asyncio.to_thread(
+            self._git, "pull", "--ff-only", timeout=60
+        )
+        if pull_code != 0:
+            return "\n".join(lines) + f"\n\n拉取失败：{pull_out[:400]}"
+        newv = ""
+        try:
+            newv = self._read_version(
+                (self._plugin_dir / "metadata.yaml").read_text(encoding="utf-8")
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        lines.append("")
+        lines.append(f"已拉到 {newv or remote}。")
+        lines.append("代码已更新但还跑在旧代码上——去面板重载本插件（或发 /dy reload）。")
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------ 命令
 
     @filter.command("dy", alias={"抖音"})
@@ -1189,6 +1296,11 @@ class DouyinLearningBot(Star):
             yield event.plain_result(
                 "后台队列已停、浏览器已关闭（恢复：/dy loop on 或 /dy start）"
             )
+            return
+
+        if sub in {"update", "upgrade"}:
+            apply = any(a in {"apply", "yes", "拉取", "更新"} for a in args[1:])
+            yield event.plain_result(await self._update_text(apply=apply))
             return
 
         if sub in {"jobs", "queue", "任务"}:
