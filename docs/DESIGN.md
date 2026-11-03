@@ -1156,3 +1156,101 @@ scored = [(s, i) for s, i in scored if s > BLOCKED_SCORE and s >= floor]   # 第
 被当顶层模块加载（测试脚本 `import main`）走 `except ImportError` 那段兜底。
 我只往第一套里加了 `from .douyin.feed import parse_aweme` 和 `from .douyin import scoring`，
 兜底那套没加——测试路径就炸了。两套必须同步加。
+
+## 20. 换内核与 cookie 真相（v0.8.0）
+
+### 20.1 为什么要能换内核
+
+自带 chromium 的 UA 是 `Chrome/156`，本机 Edge 是 `Edg/143` —— 谁更「像人」不好判断，
+但用户机器上有 Edge 时，用它至少和日常浏览环境一致（同一套字体、编码、图形栈）。
+代价是 profile 不能混用，见 20.2。
+
+### 20.2 profile 必须按内核分目录（实测）
+
+| 组合 | 结果 |
+|---|---|
+| 空目录 + Edge | 正常，`title='抖音-记录美好生活'` |
+| chromium 写过的目录 + Edge | `TargetClosedError`，`exitCode=2147483651` |
+| 同上，删 `Local State` | 仍然崩 |
+| 同上，删 `Preferences` | 仍然崩 |
+| 同上，两个都删 | 仍然崩 |
+
+崩溃日志里的关键行：
+
+```
+content_settings_pref.cc:319 Invalid pattern strings: chrome://omnibox-popup.top-chrome/,*
+```
+
+结论：`profiles/<号>/` 下再分一层内核名。切换内核时把老目录的 cookie 搬一次
+（`raw_cookies()` → `add_cookies()`），实测 57 个 cookie、3.1 秒。
+
+### 20.3 cookie 的三条路，只有一条通
+
+| 路子 | 结论 |
+|---|---|
+| 解 Edge/Chrome 的 cookie 库 | `v10` 能解（DPAPI + AESGCM），`v20` 解不开 —— 密钥交给浏览器进程了 |
+| 浏览器运行时读库 | 库被独占，`WinError 32`；`mode=ro`/`immutable=1` 都是 unable to open |
+| 插件自己的 profile | 唯一稳的：扫一次码，之后靠心跳和到期检查续命 |
+
+所以「实时自动拿 cookie」不是偷，是**养**：`cookie_keepalive_min` 定时访问首页，
+`sid_guard` 快到期就叫人。
+
+### 20.4 sid_guard 的真实格式
+
+```
+0170c8569213f5fde30c56729526a94c|1793743872|5184000|Sat, 02-Jan-2027 22:11:12 GMT
+      hash                        | 签发时间  | 有效期 | 过期时刻
+```
+
+第 2 段是**签发时间**。按它当过期时间算，刚登录的会话会被判成已过期（我们踩过）。
+第 4 段才是过期时刻，`%a, %d-%b-%Y %H:%M:%S GMT`。
+
+### 20.5 会话作废时的样子
+
+- cookie 里 `sessionid` 还在（32 字节）
+- `/user/profile/self/` 还能回 `{'code': 0, 'nick': '大肥鱼Yume'}`
+- 但 `POST /aweme/v1/web/comment/publish/` 回 `{"comment":null,"status_code":8}`
+- 点赞同样 `status_code: 4`
+
+重新扫码后立刻恢复：同一条视频 `publish` 回 `code 0` 并给 `cid`。
+
+### 20.6 打不开的视频
+
+feed 里挑到的卡片不都能开。`/video/<id>` 落到 `data-e2e="error-page"` 时：
+`document.querySelector('video')` 可能还在（占位），但 `videoWidth == 0`，
+分享图标、评论框、播放器控件全没有。判定用「error-page 且 videoWidth 为 0」。
+
+处理：`/video/<id>` → `/discover?modal_id=<id>` → 再来一次 `/video/<id>`，
+三次都不行就跳过这条（上层换下一条）。
+
+### 20.7 uid 缓存
+
+`@人` 的 `text_extra` 只需要 `user_id`，而 `user_id` 只能从分享面板的行里刮
+（`data-userid`）。面板要在详情页 hover 才出来，实测有时四轮都不出。
+
+于是刮到就存 `work/uid_cache.json`：
+
+```json
+{"yezheyue": "2634023404581211", "大肥鱼Yume": "4330304429101319"}
+```
+
+之后发评论直接读缓存，**完全不用开视频页**（实测从首页直接发，回 cid 并可删）。
+
+### 20.8 二次验证也算人机验证
+
+界面发评论被拦时页面会出现 `el:second-verify-mask` / `el:second-verify-panel`。
+这跟滑块一样要人点一下，所以现在直接抛 `HumanVerifyNeeded`，走「搬窗口 + 叫你」，
+不再只回一句「已发送（可能被拦）」。
+
+### 20.9 实测记录（Edge 内核，真实 profile）
+
+| 项 | 结果 |
+|---|---|
+| 登录态 | `True`，身份 `大肥鱼Yume` |
+| 取流 | 69 条 / 15.2s |
+| 下载 | 17.0 MB / 48.0s |
+| 抽帧 + 拼图 | 4 帧 / 346 KB |
+| 点赞 → 取消 | `未赞 → 已赞` → `已赞 → 未赞` |
+| @ 评论（缓存路径） | `已发布（cid=7704067476850328335）`，@ 已带上，随后删除成功 |
+| 分享 | 面板行按钮显示「捎句话」（已分享，可再补一句） |
+
