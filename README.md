@@ -197,6 +197,20 @@ ttwid：有｜csrf：有｜内核：msedge
 现在判定会带上 `sid_guard`（`hash|签发时间|有效期秒数|过期日期`，**第 4 段才是过期时间**），
 快到点就按「需要登录」处理，走搬窗口 + 发二维码那条求助流程。
 
+### 手上只有 cookie 串？贴进来就行
+
+面板 → 写操作上方的 **browser.cookie_string**（`浏览器` 分组）：浏览器登录 douyin.com 后，
+F12 → Network → 点任意请求 → Request Headers 里 `cookie:` 那整行，复制过来贴上去。
+
+```
+ttwid=1%7C...; sessionid=...; sessionid_ss=...; sid_tt=...; passport_csrf_token=...; ...
+```
+
+只需要 `k=v; k=v` 这一段。**不用管 `msToken` / `X-Bogus` / `a_bogus`** —— 评论、点赞、
+分享都是插件在页面里 `fetch` 发的，签名由抖音自己的 JS 现算，签名参数不在请求头里也能过。
+
+贴完发 `/dy cookie` 看「登录态：是」就成。`none` / `null` / `-` 这种占位值会被跳过。
+
 ### 两个新坑
 
 - **打不开的视频**：feed 里会挑到直播卡、带货卡，`/video/<id>` 打开后是 `data-e2e="error-page"`，
