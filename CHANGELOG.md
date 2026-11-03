@@ -2,6 +2,19 @@
 
 版本号规则：`主.次.修订`。次版本号进位 = 有新能力或有不兼容的配置变化，修订号 = 修 bug / 调参数。
 
+## 0.8.1 — 2026-11-04
+
+**粘贴式 cookie（`browser.cookie_string`）**
+
+- 新增配置 `browser.cookie_string`：把浏览器 F12 里那条 `cookie:` 原样贴进来，
+  插件启动时灌进上下文，域名统一 `.douyin.com`
+- 解决「手上没有登录态、又不想扫码」这类情况；`none` / `null` / `-` 这类占位值会被跳过
+- 不需要自己实现 `msToken` / `a_bogus`：评论与点赞都是在**页面里** `fetch` 的，
+  签名由抖音自己的 JS 现算。实测同一条视频 `POST /aweme/v1/web/comment/publish/`
+  回 `{"status_code":0,"comment":{"cid":...}}`，随后可删
+- 会话作废时（cookie 还在、`/user/profile/self/` 还能回昵称）写操作一律 `status_code: 8`，
+  这是「需要重新登录」的信号，不是缺 cookie
+
 ## 0.8.0 — 2026-11-04
 
 **换 Edge 内核 + 把「cookie 从哪来」讲清楚**
