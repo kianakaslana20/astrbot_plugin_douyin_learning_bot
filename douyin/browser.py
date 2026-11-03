@@ -280,11 +280,13 @@ class DouyinBrowser:
         except Exception:  # noqa: BLE001
             return False
 
-    async def show_window(self, page=None) -> bool:
-        """把窗口从屏幕外挪回屏幕中央。
+    async def show_window(self, page=None, topmost: bool = True) -> bool:
+        """把窗口从屏幕外挪回桌面，并（默认）置顶，人能直接看见、能扫码。
 
         quiet_window 把窗口放在 (-32000,-32000)，人既看不到也拖不到滑块，
-        所以一旦要人工介入就得先搬回来（CDP Browser.setWindowBounds）。
+        所以一旦要人工介入就得先搬回来（CDP Browser.setWindowBounds），
+        再借 Win32 SetWindowPos 真置顶 —— CDP 没有置顶能力，
+        浏览器进程被别人挡住时就白搬了。
         """
         try:
             page = page if page is not None else await self._page()
@@ -302,10 +304,105 @@ class DouyinBrowser:
             )
             await page.bring_to_front()
             logger.info("浏览器窗口已挪到屏幕中央")
-            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("挪窗口失败：%s", exc)
             return False
+        if topmost:
+            self.focus_window()
+        return True
+
+    # ---- Win32：把浏览器窗口提到最前（CDP 做不到）----
+    @staticmethod
+    def _win32_windows():
+        """枚举可见的顶层窗口，返回 [(hwnd, title, exe)]。"""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        out = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            exe = ""
+            h = k32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
+            if h:
+                try:
+                    sz = wintypes.DWORD(1024)
+                    path = ctypes.create_unicode_buffer(1024)
+                    if k32.QueryFullProcessImageNameW(h, 0, path, ctypes.byref(sz)):
+                        exe = path.value.rsplit("\\", 1)[-1].lower()
+                finally:
+                    k32.CloseHandle(h)
+            out.append((hwnd, buf.value, exe))
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        return out
+
+    def focus_window(self, titles=("抖音",), exes=("msedge.exe", "chrome.exe")) -> str:
+        """把浏览器窗口提到最前并还原（如果最小化了）。返回命中的窗口标题。"""
+        try:
+            import ctypes
+            import time as _t
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            SW_RESTORE = 9
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW = 0x0002, 0x0001, 0x0040
+            hit = ""
+            for hwnd, title, exe in self._win32_windows():
+                if exe not in exes:
+                    continue
+                if titles and not any(t in title for t in titles):
+                    continue
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                # 先置顶再退回普通层级：既抢到焦点，又不永久钉在最上层
+                user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+                user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+                user32.SetForegroundWindow(hwnd)
+                hit = title
+                break
+            if hit:
+                logger.info("已把窗口提到前台：%s", hit)
+            else:
+                logger.info("没找到抖音浏览器窗口（可能还没打开页面）")
+            _t.sleep(0.2)
+            return hit
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("置顶窗口失败：%s", exc)
+            return ""
+
+    def window_rect(self) -> tuple:
+        """当前浏览器窗口在屏幕上的位置 (left, top, width, height)；找不到回 (None,)*4。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+            for hwnd, title, exe in self._win32_windows():
+                if exe in ("msedge.exe", "chrome.exe") and "抖音" in title:
+                    r = RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                        return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+            return (None, None, None, None)
+        except Exception:  # noqa: BLE001
+            return (None, None, None, None)
 
     async def wait_captcha_clear(
         self, timeout_s: int = 300, poll_s: int = 2, page=None
