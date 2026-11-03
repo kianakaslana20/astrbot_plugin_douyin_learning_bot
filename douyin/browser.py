@@ -142,7 +142,47 @@ class DouyinBrowser:
             await self._ctx.add_init_script(_STEALTH_JS)
         except Exception:
             pass
+        await self.apply_cookie_string()
         return self._ctx
+
+    # 粘贴式 cookie：把浏览器里 F12 → Network → Request Headers 里那整条
+    # `cookie:` 值原样贴进配置就行。签名（msToken / a_bogus）不用管 ——
+    # 写操作是在页面里 fetch 的，签名由页面自己的 JS 现算。
+    _COOKIE_JUNK = {"", "none", "null", "-"}
+
+    async def apply_cookie_string(self) -> int:
+        """把 browser.cookie_string 里的 cookie 灌进上下文，返回灌了几个。"""
+        raw = str(getattr(self.settings, "cookie_string", "") or "").strip()
+        if not raw or raw.lower() in self._COOKIE_JUNK:
+            return 0
+        items = []
+        for part in raw.replace("\n", ";").split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, _, value = part.partition("=")
+            name, value = name.strip(), value.strip()
+            if not name or value.lower() in self._COOKIE_JUNK:
+                continue
+            items.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": ".douyin.com",
+                    "path": "/",
+                }
+            )
+        if not items:
+            logger.warning("browser.cookie_string 里没解析出 cookie")
+            return 0
+        ctx = self._ctx or await self._ensure()
+        try:
+            await ctx.add_cookies(items)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cookie_string 灌不进去：%s", exc)
+            return 0
+        logger.info("已从 cookie_string 灌入 %s 个 cookie", len(items))
+        return len(items)
 
     async def _shutdown_playwright(self) -> None:
         if self._pw is not None:
