@@ -174,6 +174,7 @@ class Settings:
     profile_dir: str = ""
     channel: str = "msedge"          # msedge = 用系统 Edge 内核（默认）；"" = Playwright 自带 chromium
     cookie_source: str = "auto"      # auto = profile 没登录时先试着从本机 Edge/Chrome 借一次
+    window_on_login: bool = True    # 需要人扫码/过验证时，自动把窗口摆到桌面上（不用再找）
     cookie_string: str = ""          # 粘贴整条 cookie 串（浏览器 F12 里原样复制，只填 k=v; k=v）
     cookie_keepalive_min: int = 20   # 每隔多少分钟摸一下抖音让站点自己续 cookie（0 = 不保活）
 
@@ -280,6 +281,7 @@ class Settings:
             profile_dir=_as_str(br.get("profile_dir"), ""),
             channel=_as_str(br.get("channel"), "msedge"),
             cookie_source=_as_str(br.get("cookie_source"), "auto").lower(),
+            window_on_login=_as_bool(br.get("window_on_login"), True),
             cookie_string=_as_str(br.get("cookie_string"), ""),
             cookie_keepalive_min=_as_int(br.get("cookie_keepalive_min"), 20, 0, 24 * 60),
             want=_as_int(fd.get("want"), 8, 1, 60),
