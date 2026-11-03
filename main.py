@@ -29,7 +29,12 @@ except Exception:  # pragma: no cover - 兼容旧路径
 
 try:  # 正常情况：被 AstrBot 当作 data.plugins.<name>.main 加载
     from .douyin import scoring
-    from .douyin.browser import DouyinBlocked, DouyinBrowser, HumanVerifyNeeded
+    from .douyin.browser import (
+        DouyinBlocked,
+        DouyinBrowser,
+        HumanVerifyNeeded,
+        ProfileKernelMismatch,
+    )
     from .douyin.config import Settings, resolve_umo
     from .douyin.feed import parse_aweme
     from .douyin.jobs import Job, JobQueue
@@ -42,7 +47,12 @@ except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from douyin import scoring  # type: ignore
-    from douyin.browser import DouyinBlocked, DouyinBrowser, HumanVerifyNeeded  # type: ignore
+    from douyin.browser import (  # type: ignore
+        DouyinBlocked,
+        DouyinBrowser,
+        HumanVerifyNeeded,
+        ProfileKernelMismatch,
+    )
     from douyin.config import Settings, resolve_umo  # type: ignore
     from douyin.feed import parse_aweme  # type: ignore
     from douyin.jobs import Job, JobQueue  # type: ignore
@@ -700,8 +710,14 @@ class DouyinLearningBot(Star):
         if not self.settings.enabled:
             job.error = "插件总开关是关的（配置里 enabled=false）"
             return None
-        await self._migrate_kernel_profile()
-        if not await self._ensure_login(job):
+        try:
+            await self._migrate_kernel_profile()
+            if not await self._ensure_login(job):
+                return None
+        except ProfileKernelMismatch as exc:
+            # profile 被要求换内核 = 会写坏它，直接停手，把原因原样告诉他
+            job.error = str(exc)
+            logger.error("profile 内核不一致，拒绝启动：%s", exc)
             return None
         # 顺手保活：让站点自己续 ttwid / msToken / bd-ticket-guard，别等它悄悄过期
         try:
