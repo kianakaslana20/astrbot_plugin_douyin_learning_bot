@@ -2,6 +2,22 @@
 
 版本号规则：`主.次.修订`。次版本号进位 = 有新能力或有不兼容的配置变化，修订号 = 修 bug / 调参数。
 
+## 0.8.3 — 2026-11-04
+
+**profile 不再被写坏；「登录态丢了」是误判**
+
+- 新增 `channel.lock`：每份 profile 记 `{channel, fingerprint, at}`，换内核启动直接拒绝，
+  错误信息里带上次内核、时间与替代方案（`ProfileKernelMismatch`）
+- fallback 改用独立目录 `profiles/<号>/<channel>-chromium`（原来复写同一目录，这才是写坏的路径）
+- headless 禁令：真实 profile（有 Cookies 库或 lock）拒绝 headless，headless 只放行临时目录
+- 修窗口：隐藏窗口继承 `SW_HIDE` 时不再被漏掉（`ShowWindow(SW_SHOWNORMAL)`）；
+  `OpenProcess` 被拒时按标题兜底认窗口
+- 文档纠正：`Cookies.value` 列本来为空，真实值在 `encrypted_value`；
+  「sessionid 被清零」是误读，真正失效是服务端把会话顶掉（`status_code:8`）
+
+真机验收（2026-11-04 07:3x）：`logged_in=True`、`nick=大肥鱼Yume`、取流 51 条、
+评论 `cid=7704088579237298994` 并 @yezheyue 成功、随后删除成功。
+
 ## 0.8.2 — 2026-11-04
 
 **窗口不再躲着人**
