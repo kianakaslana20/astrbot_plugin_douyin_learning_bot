@@ -943,11 +943,20 @@ class DouyinLearningBot(Star):
             f"  保活间隔：{str(gap) + ' 分钟' if gap else '关着（cookie 只能靠自然访问续命）'}"
             f"｜借 cookie：{self.settings.cookie_source}"
         )
+        paste = str(getattr(self.settings, "cookie_string", "") or "").strip()
+        if paste:
+            n = len([p for p in paste.replace("\n", ";").split(";") if "=" in p])
+            lines.append(f"  粘贴式 cookie：填了（约 {n} 段，启动时灌进 profile）")
+        else:
+            lines.append("  粘贴式 cookie：没填（browser.cookie_string）")
         lines.append(
             "\n说明：评论/点赞/分享用的就是这套 cookie，它由页面自己下发、"
             "存在 profile 里，不需要你手工粘任何东西。失效时会自动叫你扫码。"
         )
         lines.append("想把本机浏览器里的登录态直接搬过来：/dy cookie import edge")
+        lines.append(
+            "只有 cookie 串没有浏览器：把它贴到面板 browser.cookie_string，重启一次即可。"
+        )
         return "\n".join(lines)
 
     async def _update_text(self, apply: bool = False) -> str:
