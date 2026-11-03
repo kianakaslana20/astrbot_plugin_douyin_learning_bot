@@ -60,6 +60,24 @@ class HumanVerifyNeeded(RuntimeError):
         self.reason = reason
 
 
+class ProfileKernelMismatch(RuntimeError):
+    """同一个 profile 目录被要求换内核启动 —— 会写坏 profile，直接拒绝。"""
+
+
+def _argv_fingerprint(channel: str, args: list, extra: dict) -> str:
+    """参数指纹：内核 + 启动参数 + 几个会写进 profile 的关键项。"""
+    import hashlib
+    import json as _json
+
+    blob = _json.dumps(
+        {"channel": channel, "args": sorted(args),
+         "locale": extra.get("locale"), "viewport": extra.get("viewport"),
+         "tz": extra.get("timezone_id")},
+        ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
 class DouyinBrowser:
     """单例式浏览器：整个插件生命周期只开一份，collect 之间复用登录态。"""
 
@@ -71,9 +89,11 @@ class DouyinBrowser:
         self._lock = asyncio.Lock()
         self._closed = False
         self.channel_used = ""            # 实际用上的内核：msedge / chromium / chromium(fallback)
+        self.profile_used = profile_dir   # 实际落地的目录（fallback 时会换）
         self._last_keepalive = 0.0        # 上次保活的时间戳（time.time()）
         self._session_checked_at = 0.0    # 上次用 /user/profile/self/ 复核登录态的时间
         self._session_expired = False     # sid_guard 说会话已过期（cookie 还在，写操作会回 8）
+        self.channel_lock = profile_dir / "channel.lock"   # 这份 profile 是哪个内核写的
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -83,6 +103,7 @@ class DouyinBrowser:
         from playwright.async_api import async_playwright
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self._guard_kernel()
         self._pw = await async_playwright().start()
         launch_kwargs: dict = {
             "headless": bool(self.settings.headless),
@@ -117,18 +138,27 @@ class DouyinBrowser:
                 str(self.profile_dir), **launch_kwargs
             )
             self.channel_used = self.settings.channel or "chromium"
+            self.profile_used = self.profile_dir
+            self._write_lock(self.channel_used, launch_kwargs.get("args", []), launch_kwargs)
         except Exception as exc:  # 目录被上一个进程占用等
             # 通道不可用（比如这台机器没装 Edge）就退回自带 chromium，别把整轮搞死
             if launch_kwargs.pop("channel", None):
+                # 关键：**换目录**。同一个目录被两种内核写过，下次谁都开不了
+                fb_dir = self.profile_dir.with_name(self.profile_dir.name + "-chromium")
                 logger.warning(
-                    "用 %s 内核启动失败（%s），退回 Playwright 自带 chromium",
-                    self.settings.channel, type(exc).__name__,
+                    "用 %s 内核启动失败（%s），退回自带 chromium，但换到独立目录 %s"
+                    "（复用原目录会把 profile 写坏）",
+                    self.settings.channel, type(exc).__name__, fb_dir.name,
                 )
                 try:
+                    fb_dir.mkdir(parents=True, exist_ok=True)
                     self._ctx = await self._pw.chromium.launch_persistent_context(
-                        str(self.profile_dir), **launch_kwargs
+                        str(fb_dir), **launch_kwargs
                     )
                     self.channel_used = "chromium(fallback)"
+                    self.profile_used = fb_dir
+                    self._write_lock("chromium", launch_kwargs.get("args", []),
+                                     launch_kwargs, profile=fb_dir)
                 except Exception as exc2:  # noqa: BLE001
                     await self._shutdown_playwright()
                     raise DouyinBlocked(
@@ -183,6 +213,76 @@ class DouyinBrowser:
             return 0
         logger.info("已从 cookie_string 灌入 %s 个 cookie", len(items))
         return len(items)
+
+    # ------------------------------------------------------------------ 内核锁定
+
+    def _guard_kernel(self) -> None:
+        """启动前把关：headless 不许碰真实 profile；不许换内核复用同一目录。"""
+        channel = self.settings.channel or "chromium"
+        if getattr(self.settings, "headless", False):
+            if self._looks_like_real_profile():
+                raise DouyinBlocked(
+                    f"headless 不允许打开真实 profile（{self.profile_dir}）："
+                    "headless 会被抖音识别成验证码中间页，而且会把 profile 写成另一种形态。"
+                    "要无头跑请用临时目录，真实 profile 只能用 headful。"
+                )
+            logger.warning("headless 模式只用于临时目录：%s", self.profile_dir)
+            return
+
+        lock = self._read_lock()
+        if not lock:
+            return
+        was = str(lock.get("channel") or "")
+        if was and was != channel:
+            hint = (
+                f"\n这份 profile 上次是用「{was}」内核打开的（{lock.get('at', '?')}），"
+                f"现在要求用「{channel}」。两种内核混写同一目录会直接崩"
+                "（TargetClosedError / exitCode=2147483651）。"
+            )
+            alt = self.profile_dir.with_name(channel)
+            if alt.exists():
+                hint += f"\n旁边已经有 {alt.name} 目录，把 browser.channel 改回去，或让插件用它。"
+            else:
+                hint += (
+                    f"\n要换内核：新建一份 profile（/dy account new <名字>）后重新扫码；"
+                    f"或者把本目录整体复制成 {alt.name} 再用新内核打开。"
+                )
+            raise ProfileKernelMismatch(
+                f"profile 内核不一致：{self.profile_dir}{hint}"
+            )
+
+    def _looks_like_real_profile(self) -> bool:
+        """目录里有没有真的登录态（cookie 库存在且非空，或已有内核锁）。"""
+        ck = self.profile_dir / "Default" / "Network" / "Cookies"
+        if ck.exists() and ck.stat().st_size > 8 * 1024:
+            return True
+        return self.channel_lock.exists()
+
+    def _read_lock(self) -> dict:
+        try:
+            if self.channel_lock.exists():
+                import json as _json
+
+                return _json.loads(self.channel_lock.read_text(encoding="utf-8") or "{}")
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+
+    def _write_lock(self, channel: str, args: list, extra: dict, profile: Path | None = None) -> None:
+        import json as _json
+        import time as _t
+
+        path = (profile or self.profile_dir) / "channel.lock"
+        data = {
+            "channel": channel,
+            "fingerprint": _argv_fingerprint(channel, args, extra),
+            "at": _t.strftime("%Y-%m-%d %H:%M:%S"),
+            "version": 1,
+        }
+        try:
+            path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("写 channel.lock 失败：%s", exc)
 
     async def _shutdown_playwright(self) -> None:
         if self._pw is not None:
@@ -324,9 +424,10 @@ class DouyinBrowser:
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def _cb(hwnd, _lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
+            vis = bool(user32.IsWindowVisible(hwnd))
             n = user32.GetWindowTextLengthW(hwnd)
+            if n == 0:
+                return True
             buf = ctypes.create_unicode_buffer(n + 1)
             user32.GetWindowTextW(hwnd, buf, n + 1)
             pid = wintypes.DWORD()
@@ -341,7 +442,7 @@ class DouyinBrowser:
                         exe = path.value.rsplit("\\", 1)[-1].lower()
                 finally:
                     k32.CloseHandle(h)
-            out.append((hwnd, buf.value, exe))
+            out.append((hwnd, buf.value, exe, vis))
             return True
 
         user32.EnumWindows(_cb, 0)
@@ -359,11 +460,16 @@ class DouyinBrowser:
             HWND_NOTOPMOST = -2
             SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW = 0x0002, 0x0001, 0x0040
             hit = ""
-            for hwnd, title, exe in self._win32_windows():
-                if exe not in exes:
+            SW_SHOWNORMAL = 1
+            for hwnd, title, exe, vis in self._win32_windows():
+                if exe and exe not in exes:      # exe 取不到（Access denied）时按标题认
                     continue
                 if titles and not any(t in title for t in titles):
                     continue
+                if not vis:
+                    # 我们自己是被隐藏窗口的 shell 拉起来的，Edge 会继承 SW_HIDE，
+                    # 窗口建出来就是不可见的 —— 这里强行显示出来
+                    user32.ShowWindow(hwnd, SW_SHOWNORMAL)
                 user32.ShowWindow(hwnd, SW_RESTORE)
                 # 先置顶再退回普通层级：既抢到焦点，又不永久钉在最上层
                 user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -395,12 +501,16 @@ class DouyinBrowser:
                 _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                             ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
-            for hwnd, title, exe in self._win32_windows():
-                if exe in ("msedge.exe", "chrome.exe") and "抖音" in title:
+            best = None
+            for hwnd, title, exe, vis in self._win32_windows():
+                if (exe in ("msedge.exe", "chrome.exe") or not exe) and "抖音" in title:
                     r = RECT()
                     if user32.GetWindowRect(hwnd, ctypes.byref(r)):
-                        return (r.left, r.top, r.right - r.left, r.bottom - r.top)
-            return (None, None, None, None)
+                        cand = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+                        if vis:
+                            return cand
+                        best = best or cand
+            return best or (None, None, None, None)
         except Exception:  # noqa: BLE001
             return (None, None, None, None)
 
