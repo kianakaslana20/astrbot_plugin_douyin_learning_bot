@@ -172,7 +172,9 @@ class Settings:
     headless: bool = False
     quiet_window: bool = True      # 把浏览器窗口挪到屏幕外，后台跑不抢焦点（headless 会被风控，只能这样）
     profile_dir: str = ""
-    channel: str = ""
+    channel: str = "msedge"          # msedge = 用系统 Edge 内核（默认）；"" = Playwright 自带 chromium
+    cookie_source: str = "auto"      # auto = profile 没登录时先试着从本机 Edge/Chrome 借一次
+    cookie_keepalive_min: int = 20   # 每隔多少分钟摸一下抖音让站点自己续 cookie（0 = 不保活）
 
     # 取流
     want: int = 8
@@ -275,7 +277,9 @@ class Settings:
             headless=_as_bool(br.get("headless"), False),
             quiet_window=_as_bool(br.get("quiet_window"), True),
             profile_dir=_as_str(br.get("profile_dir"), ""),
-            channel=_as_str(br.get("channel"), ""),
+            channel=_as_str(br.get("channel"), "msedge"),
+            cookie_source=_as_str(br.get("cookie_source"), "auto").lower(),
+            cookie_keepalive_min=_as_int(br.get("cookie_keepalive_min"), 20, 0, 24 * 60),
             want=_as_int(fd.get("want"), 8, 1, 60),
             max_scroll=_as_int(fd.get("max_scroll"), 6, 1, 50),
             scroll_wait_ms=_as_int(fd.get("scroll_wait_ms"), 2800, 500, 15000),
