@@ -47,14 +47,33 @@
       },
       "channel": {
         "type": "string",
-        "description": "浏览器通道",
-        "default": "",
+        "description": "浏览器内核",
+        "default": "msedge",
         "options": [
-          "",
+          "msedge",
           "chrome",
-          "msedge"
+          "",
+          "chromium"
         ],
-        "hint": "留空用 Playwright 自带 chromium；登录态异常时试试 msedge"
+        "hint": "msedge = 用系统 Edge 内核（默认，最像真人，实测取流更快）；chrome = 系统 Chrome；留空 = Playwright 自带 chromium（吃不到系统内核的指纹）"
+      },
+      "cookie_source": {
+        "type": "string",
+        "description": "profile 没登录时，能不能从本机浏览器借 cookie",
+        "default": "auto",
+        "options": [
+          "auto",
+          "edge",
+          "chrome",
+          "profile"
+        ],
+        "hint": "auto = 先试着从 Edge/Chrome 借（不用你扫码），借不到再叫你扫；profile = 只用本插件 profile 里的登录态。注意：浏览器开着时库被独占，新版浏览器的 cookie 也可能解不开（App-Bound 加密）"
+      },
+      "cookie_keepalive_min": {
+        "type": "int",
+        "description": "cookie 保活间隔（分钟）",
+        "default": 20,
+        "hint": "每隔这么久摸一次抖音首页，让站点自己续 ttwid / msToken / bd-ticket-guard。0 = 不保活（只靠刷视频时自然访问）"
       }
     }
   },
