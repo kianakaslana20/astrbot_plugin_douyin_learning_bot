@@ -148,6 +148,57 @@ docs/
   DESIGN.md           设计笔记与实测量表（怎么试出来的）
 ```
 
+## 三点九七、profile 内核锁与「登录态丢了」的真相（v0.8.3）
+
+### 先说结论：cookie 从来没被清空
+
+排查时我读到 `Cookies` 表里 `sessionid` 的 `length(value) = 0`，据此判断「被清零」。
+**这是读错了列**：Chromium 的明文列 `value` 本来就是空的，真实值在 `encrypted_value`。
+正确判断方式是拿 Playwright 的 `context.cookies()`（它会解密），或者查 `encrypted_value` 长度。
+
+真正丢了登录态的原因是另一件事：**同一个 `sessionid` 被多个 profile 副本同时用**，
+抖音服务端把会话顶掉了。表象很迷惑——cookie 一个不少、`sid_guard` 也没到期，
+但 `/user/profile/self/` 回 `"status_code":8, "status_msg":"用户未登录"`。
+
+### profile 是怎么被写坏的
+
+```
+Edge 拒绝在同一 user-data-dir 上开第二个实例
+   → 报「请在已运行的浏览器会话中打开」
+   → Playwright 抛 TargetClosedError
+   → 旧代码 fallback：**在同一个目录**改用自带 chromium 打开
+   → 目录里同时有 Edge 的 Local State 契约和 chromium 的写入
+   → 下次谁开都崩（exitCode=2147483651 / STATUS_BREAKPOINT）
+```
+
+所以「写坏」不是单次 launch 参数不一致，而是**失败的 fallback 往同一目录里换了内核**。
+
+### 三条防护（v0.8.3）
+
+| 防护 | 行为 |
+|---|---|
+| `channel.lock` | 每份 profile 记 `{channel, fingerprint, at}`；下次发现内核不同就**拒绝启动**，把两边内核、时间、替代方案一起说清 |
+| fallback 换目录 | 内核起不来 → 改用 `profiles/<号>/msedge-chromium`，不再复用原目录 |
+| headless 禁令 | 真实 profile（有 Cookies 库或已存在 lock）一律不许 headless；headless 只放行临时目录 |
+
+`/dy` 里没有新增命令，触发时后台会直接把原因推给你，例如：
+
+```
+profile 内核不一致：...\profiles\小号\msedge
+这份 profile 上次是用「msedge」内核打开的（2026-11-04 07:26:11），现在要求用「chromium」。
+两种内核混写同一目录会直接崩（TargetClosedError / exitCode=2147483651）。
+要换内核：新建一份 profile（/dy account new <名字>）后重新扫码；
+或者把本目录整体复制成 chromium 再用新内核打开。
+```
+
+### 顺手修的两个窗口坑
+
+1. **隐藏窗口继承**：DSH 的 shell 是隐藏窗口，Playwright 拉起的 Edge 会继承 `SW_HIDE`，
+   窗口建出来 `IsWindowVisible=false`，CDP 却说它在 `(80,60)`。现在认窗口时**不按可见性过滤**，
+   命中后先 `ShowWindow(SW_SHOWNORMAL)`。
+2. **OpenProcess 被拒**：浏览器进程常在不同完整性级别，`QueryFullProcessImageNameW` 可能取不到进程名。
+   取不到时按标题（含「抖音」）兜底，不再因为拿不到 `msedge.exe` 就放弃置顶。
+
 ## 三点九五、窗口调到前台（v0.8.2）
 
 后台跑久了会忘掉浏览器长什么样；更麻烦的是 `quiet_window` 把窗口放在
