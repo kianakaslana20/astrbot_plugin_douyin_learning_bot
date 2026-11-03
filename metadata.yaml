@@ -1,0 +1,46 @@
+name: astrbot_plugin_douyin_learning_bot
+display_name: 抖音刷视频学习助手
+short_desc: 替你刷抖音推荐流，挑值得看的做语音转写 + 画面理解，输出学习简报
+desc: |-
+  让 AstrBot 自己刷抖音（Web 推荐流），按兴趣与知识密度打分挑片，下载无水印源视频，
+  抽 9 帧拼图 + 语音转写，交给模型产出「讲了什么 / 有没有干货 / 值不值得看」的简报，
+  可推送到指定会话，并把结果沉淀成可检索的知识库。
+
+  实现要点：
+  - 取流走 headful Playwright 旁听页面自身发出的 /aweme/v1/web/tab/feed 或
+    /aweme/v2/web/module/feed 响应，不实现 a_bogus 签名；纯观看不需要登录。
+  - 无水印直链取 video.play_addr.url_list，支持 Range 分段，可限量下载。
+  - 理解链路：ffmpeg 抽 16k 单声道音轨走 STT + 9 帧九宫格拼图走视觉模型。
+  - 写操作（点赞 / 评论含 @ / 分享给好友或群）默认 action_mode=ask，逐条确认；
+    (视频, 动作, 目标) 级去重，重跑不会重复发同一条。
+  - 掉登录会把二维码图直接发到聊天；弹人机验证会把窗口搬到桌面并叫你拖滑块。
+  - 多开：/dy account 管理多份浏览器 profile，一个 profile 一个号，扫码一次长期有效。
+help: |-
+  /dy            状态与用法
+  /dy start [n]  排一轮到后台（立刻返回，跑完推给你）
+  /dy loop on|off  后台自动刷
+  /dy jobs       看后台队列：在跑什么、进度、排了几个
+  /dy stop       停队列 + 关浏览器
+  /dy login      发一张登录二维码到聊天，扫完自己继续
+  /dy account    多开：列 profile / 切号 / new <名字> 新建
+  /dy verify     弹人机验证时：把窗口搬到桌面并等它过去
+  /dy push [目标]  设简报推送目标
+  /dy like [off] 给最近这条点赞 / 取消赞
+  /dy share [对象] 分享最近这条（受白名单限制）
+  /dy comment [文本] 评论并 @ 白名单里的人
+  /dy do         执行 ask 模式攒下的动作（/dy do 跳过 丢弃）
+  /dy act off|ask|auto  写操作模式
+  /dy cfg        看当前生效配置（白名单 / 模式 / 模板）
+  /dy calib [n]  抓一批样本，看当前阈值会学哪些、过筛率多少
+  /dy kb [n]     看最近 n 条知识库
+version: 0.6.5
+author: YG
+repo: https://github.com/kianakaslana20/astrbot_plugin_douyin_learning_bot
+astrbot_version: ">=4.29.1,<5"
+tags:
+  - douyin
+  - learning
+  - asr
+  - vision
+  - automation
+  - knowledge-base

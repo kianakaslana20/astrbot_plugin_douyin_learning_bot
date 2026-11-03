@@ -1,0 +1,9 @@
+# 依赖说明
+# AstrBot 官方镜像 / 本机 venv 已自带下列包，通常无需 pip 安装：
+#   httpx, playwright, Pillow
+# 若缺 Playwright 浏览器内核，执行：
+#   python -m playwright install chromium
+# ffmpeg 优先复用 Playwright 自带的那份（ms-playwright/ffmpeg-*/ffmpeg-win64.exe）
+httpx>=0.24
+playwright>=1.40
+Pillow>=9.0

@@ -1,0 +1,30 @@
+# 运行产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 插件运行时数据（绝不能提交）
+data/
+browser_profile/
+profiles/
+social_dumps/
+*.db
+*.db-journal
+*.db-wal
+state.json
+
+# 下载/截图等临时产物
+_live/
+*.log
+*.png
+*.jpg
+*.mp4
+*.m4a
+*.wav
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

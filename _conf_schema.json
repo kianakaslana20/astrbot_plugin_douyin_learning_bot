@@ -1,0 +1,438 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "总开关",
+    "default": true,
+    "hint": "关掉后命令与后台轮询都不干活"
+  },
+  "loop_enabled": {
+    "type": "bool",
+    "description": "后台自动刷",
+    "default": false,
+    "hint": "开启后插件启动即按间隔自动刷一轮并推送简报"
+  },
+  "loop_interval_min": {
+    "type": "int",
+    "description": "后台间隔（分钟）",
+    "default": 90,
+    "hint": "两次自动刷之间的等待时间"
+  },
+  "push_target": {
+    "type": "string",
+    "description": "推送目标会话（unified_msg_origin）",
+    "default": "",
+    "hint": "三种写法都行：① 留空 = 用 /dy start 触发的那个会话；② 完整 umo，形如 大肥鱼:GroupMessage:482755644（群）或 大肥鱼:FriendMessage:1931855425（私聊）；③ 简写 群482755644 / 1931855425，插件会按当前平台补全。不知道 umo？在目标会话发 /dy，状态里会显示「当前会话 umo」。"
+  },
+  "browser": {
+    "type": "object",
+    "description": "浏览器设置",
+    "items": {
+      "headless": {
+        "type": "bool",
+        "description": "无头模式",
+        "default": false,
+        "hint": "必须保持 false：实测 headless 会被抖音识别成「验证码中间页」，拿不到数据"
+      },
+      "quiet_window": {
+        "type": "bool",
+        "description": "静默后台：把浏览器窗口挪到屏幕外",
+        "default": true,
+        "hint": "开着=后台跑、不抢焦点、不弹窗打扰；关着=窗口正常显示（调试用）。注意 headless 会被抖音识别成验证码页，所以只能这样藏"
+      },
+      "profile_dir": {
+        "type": "string",
+        "description": "浏览器 profile 目录",
+        "default": "",
+        "hint": "留空用插件数据目录下的 browser_profile；想保持登录态就别清"
+      },
+      "channel": {
+        "type": "string",
+        "description": "浏览器通道",
+        "default": "",
+        "options": [
+          "",
+          "chrome",
+          "msedge"
+        ],
+        "hint": "留空用 Playwright 自带 chromium；登录态异常时试试 msedge"
+      }
+    }
+  },
+  "feed": {
+    "type": "object",
+    "description": "取流与筛选",
+    "items": {
+      "want": {
+        "type": "int",
+        "description": "每轮想拿多少条",
+        "default": 8,
+        "hint": "实测每次滚动约 +20 条，8 条通常滚 1-2 屏"
+      },
+      "max_scroll": {
+        "type": "int",
+        "description": "最多滚动次数",
+        "default": 6,
+        "hint": "防止一直滚不停"
+      },
+      "scroll_wait_ms": {
+        "type": "int",
+        "description": "每次滚动后等待(ms)",
+        "default": 2800,
+        "hint": "太快会拿不到回包"
+      },
+      "min_duration_s": {
+        "type": "int",
+        "description": "最短时长(秒)",
+        "default": 45,
+        "hint": "太短的多数是纯娱乐切片"
+      },
+      "max_duration_s": {
+        "type": "int",
+        "description": "最长时长(秒)",
+        "default": 900,
+        "hint": "超过就不下载了，转写成本太高"
+      },
+      "min_like": {
+        "type": "int",
+        "description": "最低点赞数",
+        "default": 500,
+        "hint": "粗筛掉冷门内容"
+      },
+      "interest_keywords": {
+        "type": "string",
+        "description": "兴趣关键词（逗号分隔，加分）",
+        "default": "AI,编程,历史,科普,商业,效率,English,数学,物理,金融,写作,英语,教程,原理,经济,复盘",
+        "hint": "标题/话题命中越多分越高"
+      },
+      "block_keywords": {
+        "type": "string",
+        "description": "排除关键词（逗号分隔）",
+        "default": "纯享,小姐姐,擦边,带货,直播回放,抽奖,求关注,广告,短剧,漫剧,追剧,全集,连载",
+        "hint": "命中直接丢；剧集类另有正则重罚（第N集/合集等）"
+      },
+      "min_score": {
+        "type": "int",
+        "description": "打分下限（低于它就不学）",
+        "default": 4,
+        "hint": "6~9 更挑，2~3 更宽松。改前先用 /dy calib 看当前流的分值分布"
+      },
+      "min_knowledge_hits": {
+        "type": "int",
+        "description": "至少要命中几个真知识词",
+        "default": 1,
+        "hint": "科普/原理/解析/教程/开源/模型…这类词。填 0 等于不设这道门，填 2 只留硬货"
+      }
+    }
+  },
+  "understand": {
+    "type": "object",
+    "description": "理解链路",
+    "items": {
+      "frames": {
+        "type": "int",
+        "description": "抽帧数",
+        "default": 9,
+        "hint": "9 帧拼成 3x3 九宫格，一次调用看完全片"
+      },
+      "frame_width": {
+        "type": "int",
+        "description": "单帧宽度(px)",
+        "default": 480,
+        "hint": "480 足够看清画面，太高会撑爆视觉模型输入"
+      },
+      "asr_max_seconds": {
+        "type": "int",
+        "description": "转写最长音频(秒)",
+        "default": 480,
+        "hint": "超长视频只转前 N 秒，避免 STT 超时"
+      },
+      "stt_provider": {
+        "type": "string",
+        "description": "STT 提供商 ID",
+        "default": "",
+        "hint": "留空用当前会话默认 STT；填 provider id 则固定用它"
+      },
+      "vision_provider": {
+        "type": "string",
+        "description": "视觉/对话提供商 ID",
+        "default": "",
+        "hint": "留空用当前会话默认对话模型（需要支持图片输入）"
+      },
+      "asr_backend": {
+        "type": "string",
+        "description": "语音转写通道",
+        "default": "auto",
+        "options": [
+          "auto",
+          "astrbot",
+          "openai",
+          "local",
+          "off"
+        ],
+        "hint": "auto=AstrBot 的 STT→自填接口→本地 faster-whisper；off=不转写只靠画面"
+      },
+      "asr_api_base": {
+        "type": "string",
+        "description": "ASR 接口地址",
+        "default": "",
+        "hint": "OpenAI 兼容，如 https://api.siliconflow.cn/v1；会补 /audio/transcriptions"
+      },
+      "asr_api_key": {
+        "type": "string",
+        "description": "ASR 接口密钥",
+        "default": "",
+        "hint": "仅本机配置文件保存"
+      },
+      "asr_model": {
+        "type": "string",
+        "description": "ASR 模型名",
+        "default": "FunAudioLLM/SenseVoiceSmall",
+        "hint": "硅基流动用 FunAudioLLM/SenseVoiceSmall；OpenAI 用 whisper-1"
+      },
+      "asr_language": {
+        "type": "string",
+        "description": "转写语言",
+        "default": "zh",
+        "hint": "留空自动检测"
+      }
+    }
+  },
+  "media": {
+    "type": "object",
+    "description": "下载与清理",
+    "items": {
+      "max_download_mb": {
+        "type": "int",
+        "description": "单条最大下载(MB)",
+        "default": 220,
+        "hint": "超限直接放弃这条，避免磁盘被打满"
+      },
+      "keep_media": {
+        "type": "bool",
+        "description": "保留视频原文件",
+        "default": false,
+        "hint": "关掉则理解完只留拼图和音频，省空间"
+      },
+      "ffmpeg_path": {
+        "type": "string",
+        "description": "ffmpeg 路径",
+        "default": "",
+        "hint": "留空自动探测：PATH → Playwright 自带 ffmpeg → imageio_ffmpeg"
+      }
+    }
+  },
+  "actions": {
+    "type": "object",
+    "description": "写操作：分享给抖音好友/群、评论区发评论并 @ 人（都要先 /dy login 扫码登录）",
+    "items": {
+      "action_mode": {
+        "type": "string",
+        "description": "写操作模式",
+        "default": "off",
+        "options": [
+          "off",
+          "ask",
+          "auto"
+        ],
+        "hint": "off=只播报不动作；ask=刷完问一句，回 /dy do 才执行；auto=自动执行"
+      },
+      "share_mode": {
+        "type": "string",
+        "description": "分享通道：panel=点视频右侧分享面板（真机实测可用，默认）；im=私信抽屉发链接（兜底，搜索不过滤，命中率低）",
+        "default": "panel",
+        "options": [
+          "panel",
+          "im"
+        ]
+      },
+      "share_text": {
+        "type": "text",
+        "description": "分享时附带的话，留空=只发链接；可用 {title} {author} {url}",
+        "default": ""
+      },
+      "share_targets": {
+        "type": "template_list",
+        "description": "分享白名单：只允许把视频分享给这里列出的好友 / 群",
+        "default": [],
+        "hint": "一行一个人。开了 enforce_allowlist 后，命令里临时写不在名单里的名字会被拒。列表为空 = 谁都不发。",
+        "templates": {
+          "target": {
+            "name": "对象",
+            "items": {
+              "nick": {
+                "type": "string",
+                "description": "抖音昵称 / 群名",
+                "default": "",
+                "hint": "写界面上显示的名字；昵称片段也行（比如「老张」「兄弟群」）"
+              },
+              "enabled": {
+                "type": "bool",
+                "description": "启用",
+                "default": true
+              },
+              "note": {
+                "type": "string",
+                "description": "备注（随手记，不进逻辑）",
+                "default": ""
+              }
+            }
+          }
+        }
+      },
+      "mention_targets": {
+        "type": "template_list",
+        "description": "评论 @ 白名单：只允许 @ 这里列出的人",
+        "default": [],
+        "hint": "一行一个人。评论时会输入 @ 再点选同名候选，所以要写抖音里的真实昵称。列表为空 = 不 @ 人。",
+        "templates": {
+          "target": {
+            "name": "对象",
+            "items": {
+              "nick": {
+                "type": "string",
+                "description": "抖音昵称 / 群名",
+                "default": "",
+                "hint": "写界面上显示的名字；昵称片段也行（比如「老张」「兄弟群」）"
+              },
+              "enabled": {
+                "type": "bool",
+                "description": "启用",
+                "default": true
+              },
+              "note": {
+                "type": "string",
+                "description": "备注（随手记，不进逻辑）",
+                "default": ""
+              }
+            }
+          }
+        }
+      },
+      "comment_template": {
+        "type": "text",
+        "description": "评论文案模板",
+        "default": "看完记一笔：{summary}",
+        "hint": "可用占位符：{title} {summary} {keywords} {author} {url}；留空用默认"
+      },
+      "action_delay_s": {
+        "type": "int",
+        "description": "两个写操作之间的间隔（秒）",
+        "default": 6,
+        "hint": "别调太小，抖音对高频写操作有风控"
+      },
+      "max_actions_per_round": {
+        "type": "int",
+        "description": "每轮最多对几条视频做写操作",
+        "default": 2,
+        "hint": "0 = 不自动做（仍可用 /dy share、/dy comment 手动触发）"
+      },
+      "action_dump": {
+        "type": "bool",
+        "description": "写操作失败时保存现场",
+        "default": true,
+        "hint": "存到 plugin_data/<插件>/social_dumps/ 下的 png + html，用于按真实 DOM 校准选择器"
+      },
+      "auto_like": {
+        "type": "bool",
+        "description": "自动点赞",
+        "default": false,
+        "hint": "L2 级写操作，需要登录态，慎开（当前未接线）"
+      },
+      "auto_comment": {
+        "type": "bool",
+        "description": "自动评论（旧开关，保留兼容）",
+        "default": false,
+        "hint": "现在用 action_mode 控制；这条不再单独生效"
+      },
+      "enforce_allowlist": {
+        "type": "bool",
+        "description": "强制白名单",
+        "default": true,
+        "hint": "开：只对两个白名单里的人动手（/dy share 里临时点的名字也会被拦）；关：谁都能发（不建议）"
+      }
+    }
+  },
+  "notify": {
+    "type": "object",
+    "description": "后台运行与通知：什么时候叫我、等登录多久、闲置多久关浏览器",
+    "items": {
+      "notify_done": {
+        "type": "bool",
+        "description": "跑完推送简报",
+        "default": true,
+        "hint": "关掉就只在 /dy kb 里看，不主动推"
+      },
+      "notify_error": {
+        "type": "bool",
+        "description": "失败时推送原因",
+        "default": true
+      },
+      "notify_start": {
+        "type": "bool",
+        "description": "开跑时说一句「开始在后台刷」",
+        "default": false,
+        "hint": "后台循环每轮都会触发，默认关掉免得刷屏"
+      },
+      "notify_login": {
+        "type": "bool",
+        "description": "需要登录时主动叫你（发二维码截图）",
+        "default": true,
+        "hint": "关掉的话登录过期只会静默失败；建议保持开启"
+      },
+      "help_target": {
+        "type": "string",
+        "description": "求助目标（unified_msg_origin 或 QQ 号）",
+        "default": "",
+        "hint": "登录掉了 / 弹人机验证时往这里发求助。留空则自动找管理员和最近说过话的会话"
+      },
+      "login_wait_min": {
+        "type": "int",
+        "description": "叫了之后等扫码多少分钟",
+        "default": 6,
+        "hint": "超时这轮跳过，下一轮会再叫一次（同一次提示 10 分钟内不重复）"
+      },
+      "login_qr": {
+        "type": "bool",
+        "description": "把登录二维码截图发到聊天里",
+        "default": true,
+        "hint": "关掉就只能去看浏览器窗口——而窗口默认在屏幕外，等于看不到"
+      },
+      "login_window_s": {
+        "type": "int",
+        "description": "切到没登录的 profile 时，窗口在桌面上等多少秒",
+        "default": 90,
+        "hint": "切号 / 新建 profile 后浏览器窗口会自动摆到桌面让你扫码，到点没登录就收回、继续藏屏外"
+      },
+      "idle_close_min": {
+        "type": "int",
+        "description": "后台循环闲置多久关浏览器省内存（0=不关）",
+        "default": 30,
+        "hint": "关掉后下轮自动重开，约多花 3-5 秒；长间隔（比如 90 分钟）建议开着"
+      },
+      "stage_notify": {
+        "type": "bool",
+        "description": "推送阶段变化（取流→下载→转写）",
+        "default": false,
+        "hint": "想盯着进度就打开；平时用 /dy jobs 看更省消息"
+      },
+      "verify_notify": {
+        "type": "bool",
+        "description": "抖音弹人机验证时叫你（并把窗口搬到桌面）",
+        "default": true,
+        "hint": "关掉的话验证会一直挂着，这一轮只能算失败"
+      },
+      "verify_wait_min": {
+        "type": "int",
+        "description": "叫你之后等验证通过多少分钟",
+        "default": 5,
+        "hint": "窗口会被搬到屏幕中央，你拖完滑块它自己就接着跑"
+      },
+      "verify_retry": {
+        "type": "bool",
+        "description": "验证通过后自动重试这一轮",
+        "default": true,
+        "hint": "关掉就只是跳过这一轮，等下一轮再说"
+      }
+    }
+  }
+}
