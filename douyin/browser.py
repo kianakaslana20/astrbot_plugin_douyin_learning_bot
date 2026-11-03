@@ -70,6 +70,10 @@ class DouyinBrowser:
         self._ctx = None
         self._lock = asyncio.Lock()
         self._closed = False
+        self.channel_used = ""            # 实际用上的内核：msedge / chromium / chromium(fallback)
+        self._last_keepalive = 0.0        # 上次保活的时间戳（time.time()）
+        self._session_checked_at = 0.0    # 上次用 /user/profile/self/ 复核登录态的时间
+        self._session_expired = False     # sid_guard 说会话已过期（cookie 还在，写操作会回 8）
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -112,9 +116,27 @@ class DouyinBrowser:
             self._ctx = await self._pw.chromium.launch_persistent_context(
                 str(self.profile_dir), **launch_kwargs
             )
+            self.channel_used = self.settings.channel or "chromium"
         except Exception as exc:  # 目录被上一个进程占用等
-            await self._shutdown_playwright()
-            raise DouyinBlocked(f"浏览器启动失败：{type(exc).__name__}: {exc}") from exc
+            # 通道不可用（比如这台机器没装 Edge）就退回自带 chromium，别把整轮搞死
+            if launch_kwargs.pop("channel", None):
+                logger.warning(
+                    "用 %s 内核启动失败（%s），退回 Playwright 自带 chromium",
+                    self.settings.channel, type(exc).__name__,
+                )
+                try:
+                    self._ctx = await self._pw.chromium.launch_persistent_context(
+                        str(self.profile_dir), **launch_kwargs
+                    )
+                    self.channel_used = "chromium(fallback)"
+                except Exception as exc2:  # noqa: BLE001
+                    await self._shutdown_playwright()
+                    raise DouyinBlocked(
+                        f"浏览器启动失败：{type(exc2).__name__}: {exc2}"
+                    ) from exc2
+            else:
+                await self._shutdown_playwright()
+                raise DouyinBlocked(f"浏览器启动失败：{type(exc).__name__}: {exc}") from exc
         self._ctx.set_default_timeout(45_000)
         try:
             await self._ctx.add_init_script(_STEALTH_JS)
@@ -374,6 +396,123 @@ class DouyinBrowser:
     } catch (e) { return {code: -999, nick: '', uid: '', err: String(e)}; }
 }"""
 
+    # ------------------------------------------------------------ cookie 维护
+
+    async def raw_cookies(self) -> list[dict]:
+        """完整 cookie 对象（跨内核搬登录态用，别只拿名字）。"""
+        if self._ctx is None:
+            return []
+        try:
+            return [c for c in await self._ctx.cookies() if isinstance(c, dict)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def cookie_map(self) -> dict[str, str]:
+        """当前上下文里所有 cookie 的 name→value（写操作排查用）。"""
+        if self._ctx is None:
+            return {}
+        try:
+            return {
+                c.get("name"): c.get("value")
+                for c in await self._ctx.cookies()
+                if isinstance(c, dict) and c.get("name")
+            }
+        except Exception:  # noqa: BLE001
+            return {}
+
+    @staticmethod
+    def _sid_expiry(value: str) -> float:
+        """从 sid_guard 里解过期时间。
+
+        真实格式（实测）：
+        `0170c856...|1793743872|5184000|Sat, 02-Jan-2027 22:11:12 GMT`
+        第 2 段是**签发时间**不是过期时间，第 3 段是有效期秒数，
+        第 4 段才是过期时刻。早先按第 2 段算，会把刚登录的会话判成已过期。
+        拿不到第 4 段就退回「签发时间 + 有效期」。
+        """
+        if not value:
+            return 0.0
+        parts = [x.strip() for x in str(value).split("|")]
+        if len(parts) >= 4 and parts[3]:
+            raw = parts[3].replace("+", " ")
+            for fmt in ("%a, %d-%b-%Y %H:%M:%S GMT", "%a, %d %b %Y %H:%M:%S GMT"):
+                try:
+                    import calendar
+
+                    return float(calendar.timegm(__import__("time").strptime(raw, fmt)))
+                except Exception:  # noqa: BLE001
+                    continue
+        issued = next((float(x) for x in parts[1:3] if x.isdigit() and len(x) >= 10), 0.0)
+        ttl = next((float(x) for x in parts[2:4] if x.isdigit() and int(x) > 0), 0.0)
+        return issued + ttl if issued and ttl else issued
+
+    async def session_info(self) -> dict:
+        """当前会话的样子：有没有 sessionid、哪天到期、还剩多久、是不是已复核过。"""
+        m = await self.cookie_map()
+        sid = m.get("sessionid") or m.get("sessionid_ss") or ""
+        exp = self._sid_expiry(m.get("sid_guard", ""))
+        now = time.time()
+        return {
+            "has_session": bool(sid),
+            "sessionid_len": len(sid),
+            "expires_at": exp,
+            "expires_in_h": round((exp - now) / 3600, 1) if exp else 0.0,
+            "expired": bool(exp and exp <= now),
+            "ttwid": bool(m.get("ttwid")),
+            "csrf": bool(m.get("passport_csrf_token") or m.get("passport_csrf_token_default")),
+            "checked_at": self._session_checked_at,
+            "keepalive_at": self._last_keepalive,
+            "channel": self.channel_used,
+        }
+
+    async def import_cookies(self, browser: str = "edge", profile: str = "Default") -> int:
+        """把本机 Edge/Chrome 里已登录的抖音 cookie 搬进当前上下文，返回搬了几个。
+
+        这是「不用再扫一次码」的捷径；搬完还要用 logged_in() 复核，
+        因为浏览器里的 session 本身也可能已经过期。
+        """
+        from . import cookies as ck
+
+        items = ck.read_douyin_session(browser, profile=profile)
+        await self._ensure()
+        # 域名统一成 .douyin.com，避免 add_cookies 校验失败
+        fixed = []
+        for c in items:
+            d = c.get("domain") or ".douyin.com"
+            fixed.append({**c, "domain": ".douyin.com" if "douyin" in d else d})
+        await self._ctx.add_cookies(fixed)
+        self._last_keepalive = 0.0
+        logger.info("从 %s 搬进 %d 个抖音 cookie", browser, len(fixed))
+        return len(fixed)
+
+    async def keepalive(self, *, force: bool = False) -> bool:
+        """摸一下抖音，让站点自己续 ttwid / msToken / bd-ticket-guard 这类短寿 cookie。
+
+        网页端的 cookie 不是我们发的，是页面每访问一次就刷新一次。所以「实时拿到
+        cookie」这件事的正解不是去偷浏览器的库，而是**让这个浏览器一直像人在用**：
+        定时打开一次首页并调一次 self 接口，cookie 由站点自己下发、由 Playwright
+        自动落盘到 profile。间隔由 `cookie_keepalive_min` 控制，0 = 关掉。
+        """
+        gap_min = int(getattr(self.settings, "cookie_keepalive_min", 20) or 0)
+        if gap_min <= 0:
+            return False
+        now = time.time()
+        if not force and now - self._last_keepalive < gap_min * 60:
+            return False
+        if self._ctx is None:
+            return False
+        try:
+            page = await self._page()
+            if "douyin.com" not in (page.url or ""):
+                await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60_000)
+            await page.evaluate(self.SELF_JS)
+            self._last_keepalive = now
+            logger.info("cookie 保活：已摸过一次抖音（间隔 %s 分钟）", gap_min)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cookie 保活失败：%s", exc)
+            return False
+
     async def logged_in(self, *, launch: bool = True) -> bool:
         """有没有登录态。
 
@@ -390,14 +529,30 @@ class DouyinBrowser:
                 await self._ensure()
             except DouyinBlocked:
                 return False
-        if not ({"sessionid", "sessionid_ss"} & await self.cookies()):
+        jar = await self.cookies()
+        if not ({"sessionid", "sessionid_ss"} & jar):
             return False
+        # sid_guard 的第二段是服务端给的过期时间戳。过期之后 sessionid 还在，
+        # /user/profile/self/ 甚至还能回昵称，但**写操作一律回 status_code 8**。
+        # 所以要单独看这个时间：快到点了就按「需要重新登录」处理，让上层去叫人。
+        exp = self._sid_expiry((await self.cookie_map()).get("sid_guard", ""))
+        if exp and exp - time.time() < 300:
+            logger.warning(
+                "抖音会话%s（sid_guard 过期时间 %s），需要重新扫码",
+                "已过期" if exp <= time.time() else "5 分钟内到期",
+                time.strftime("%m-%d %H:%M", time.localtime(exp)),
+            )
+            self._session_expired = True
+            return False
+        self._session_expired = False
         self._who: dict = {}
         try:
             page = await self._page()
             if "douyin.com" not in (page.url or ""):
                 await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60_000)
             who = await page.evaluate(self.SELF_JS)
+            self._session_checked_at = time.time()
+            self._last_keepalive = self._session_checked_at   # 复核也算一次保活
         except Exception as exc:  # noqa: BLE001
             logger.warning("登录态复核失败（按未登录处理）：%s", exc)
             return False
