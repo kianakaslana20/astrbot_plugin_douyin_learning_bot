@@ -39,6 +39,12 @@
         "default": true,
         "hint": "开着=后台跑、不抢焦点、不弹窗打扰；关着=窗口正常显示（调试用）。注意 headless 会被抖音识别成验证码页，所以只能这样藏"
       },
+      "window_on_login": {
+        "type": "bool",
+        "description": "需要登录/验证时把窗口摆到桌面",
+        "default": true,
+        "hint": "开着：要扫码或过人机验证时，浏览器窗口会自动出现在桌面上并置顶，直接在里面操作（窗口里的二维码会自己刷新）。随时手动调窗口：/dy show"
+      },
       "profile_dir": {
         "type": "string",
         "description": "浏览器 profile 目录",
