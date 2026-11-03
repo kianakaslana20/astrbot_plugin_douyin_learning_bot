@@ -91,6 +91,7 @@ python -m playwright install chromium
 | `/dy cfg` | 看当前生效配置（白名单 / 模式 / 模板） |
 | `/dy calib [n]` | 抓 n 条样本，看当前阈值会学哪些、过筛率多少 |
 | `/dy kb [n]` | 看最近 n 条知识库 |
+| `/dy update` | 检查 GitHub 上的新版本（`/dy update apply` 直接 `git pull`） |
 | `/dy dom im\|share\|comment\|both` | 抓面板真实结构（校准选择器用） |
 
 ## 配置
@@ -113,7 +114,9 @@ python -m playwright install chromium
 
 - 版本号在 `metadata.yaml` 的 `version`，跟随 git tag（`v0.6.5`）
 - 每次发版更新 [CHANGELOG.md](CHANGELOG.md)，并打 tag + GitHub Release
-- 检查更新：`git -C <插件目录> fetch && git log --oneline HEAD..origin/main`，或看 Releases 页
+- 检查更新：发 `/dy update`（读 `metadata.yaml` 的 `version` 与 `origin/main` 比对，列出落后的提交）
+- 直接更新：`/dy update apply` 会 `git pull --ff-only`，然后去面板重载插件
+- 也可以手动：`git -C <插件目录> pull`，或看 [Releases](https://github.com/kianakaslana20/astrbot_plugin_douyin_learning_bot/releases) 页
 
 ## 已知限制
 

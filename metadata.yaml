@@ -33,7 +33,8 @@ help: |-
   /dy cfg        看当前生效配置（白名单 / 模式 / 模板）
   /dy calib [n]  抓一批样本，看当前阈值会学哪些、过筛率多少
   /dy kb [n]     看最近 n 条知识库
-version: 0.6.5
+  /dy update     检查 GitHub 有没有新版本（update apply 直接拉取）
+version: 0.7.0
 author: YG
 repo: https://github.com/kianakaslana20/astrbot_plugin_douyin_learning_bot
 astrbot_version: ">=4.29.1,<5"

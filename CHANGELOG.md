@@ -2,6 +2,17 @@
 
 版本号规则：`主.次.修订`。次版本号进位 = 有新能力或有不兼容的配置变化，修订号 = 修 bug / 调参数。
 
+## 0.7.0 — 2026-11-04
+
+**发布到 GitHub + 自带更新检查**
+
+- 仓库：<https://github.com/kianakaslana20/astrbot_plugin_douyin_learning_bot>，MIT
+- 新增 `/dy update`：读本地 `metadata.yaml` 的 `version` 与 `origin/main` 比对，
+  列出落后的提交；`/dy update apply` 直接 `git pull --ff-only` 并提示重载
+- 不是 git 克隆（解压装）时给出改用 clone 的说明
+- 补齐仓库文件：`CHANGELOG.md`、`LICENSE`、`.gitignore`、`.gitattributes`、`docs/DESIGN.md`
+- `metadata.yaml` 的 `repo` 指向真实仓库（AstrBot 的插件信息页会用到）
+
 ## 0.6.5 — 2026-11-04
 
 **选片收紧：两道门 + 自检命令**
