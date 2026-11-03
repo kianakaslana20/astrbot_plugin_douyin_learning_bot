@@ -74,6 +74,12 @@
         "description": "cookie 保活间隔（分钟）",
         "default": 20,
         "hint": "每隔这么久摸一次抖音首页，让站点自己续 ttwid / msToken / bd-ticket-guard。0 = 不保活（只靠刷视频时自然访问）"
+      },
+      "cookie_string": {
+        "type": "text",
+        "description": "粘贴式 cookie",
+        "default": "",
+        "hint": "浏览器登录 douyin.com 后，F12 → Network → 随便点一个请求 → Request Headers 里 `cookie:` 那整行复制过来贴这儿。只填 k=v; k=v 部分。msToken / a_bogus 不用管：评论和点赞是在页面里发的，签名由页面自己算。"
       }
     }
   },
