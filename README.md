@@ -148,6 +148,62 @@ docs/
   DESIGN.md           设计笔记与实测量表（怎么试出来的）
 ```
 
+## 三点九、换 Edge 内核 + cookie 到底从哪来（v0.8.0）
+
+### 内核
+
+`browser.channel` 默认 `msedge`，用本机 `msedge.exe`（实测 143.0.3650.66）跑。
+起不来会自动退回 Playwright 自带的 chromium，不影响功能：
+
+```
+用 msedge 内核启动失败（…），退回 Playwright 自带 chromium
+```
+
+**profile 必须按内核分目录**：`profiles/<号>/msedge`、`profiles/<号>/chromium`。
+Chromium 写过的目录直接喂 Edge 会崩，`exitCode=2147483651`（STATUS_BREAKPOINT），
+日志里是 `content_settings_pref.cc:319 Invalid pattern strings: chrome://omnibox-popup.top-chrome/,*`。
+删 `Local State` / `Preferences` 都救不回来，只有空目录才行。老目录里的登录态会自动搬一次，
+搬完日志写「已搬 N 个 cookie 到 …（下次直接用，不用扫码）」。
+
+### cookie 从哪来
+
+| 路子 | 能不能用 | 说明 |
+|---|---|---|
+| 直接读 Edge/Chrome 的 cookie 文件 | 只能读 `v10` | `v20`（App-Bound Encryption）密钥绑在浏览器进程上，解不开 |
+| 浏览器开着时读库 | 不行 | Cookies 库被独占，`mode=ro` / `immutable=1` 都报 unable to open |
+| 插件自己的 profile | **主路** | 扫一次码，之后靠 `sid_guard` 到期 + 定时心跳维持 |
+| 从本机浏览器借 | 兜底 | `cookie_source=auto` 时先试 edge / chrome，借到了就不用扫码 |
+
+所以「实时自动获取 cookie」的答案是：不是去偷浏览器的，而是**让插件自己的会话活着**。
+`/dy cookie` 能看到它现在什么状态：
+
+```
+登录态：是（大肥鱼Yume）
+sessionid：32 字节，sid_guard 剩 1415.6 小时
+ttwid：有｜csrf：有｜内核：msedge
+上次复核：06:13｜上次保活：06:10｜保活间隔：20 分钟
+```
+
+### 会话过期的表现（重要）
+
+过期后 cookie 里的 `sessionid` **还在**，`/user/profile/self/` 甚至**还能回昵称**，
+但所有写操作一律回 `status_code: 8`：
+
+```json
+{"comment":null,"status_code":8}
+```
+
+这就是「AstrBot 说发评论和艾特都需要 cookie」的真相 —— 不是缺 cookie，是会话被服务端作废了。
+现在判定会带上 `sid_guard`（`hash|签发时间|有效期秒数|过期日期`，**第 4 段才是过期时间**），
+快到点就按「需要登录」处理，走搬窗口 + 发二维码那条求助流程。
+
+### 两个新坑
+
+- **打不开的视频**：feed 里会挑到直播卡、带货卡，`/video/<id>` 打开后是 `data-e2e="error-page"`，
+  播放器控件和分享面板都不存在。现在先验页面，不行换 `?modal_id=` 入口重试，再不行跳过。
+- **uid 只能从分享面板刮**：面板只在详情页有、还要 hover 才展开。刮到就落盘
+  `work/uid_cache.json`，之后 @ 人直接读缓存，不用为了一条评论去开视频页。
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
