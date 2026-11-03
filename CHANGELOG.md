@@ -2,6 +2,22 @@
 
 版本号规则：`主.次.修订`。次版本号进位 = 有新能力或有不兼容的配置变化，修订号 = 修 bug / 调参数。
 
+## 0.8.2 — 2026-11-04
+
+**窗口不再躲着人**
+
+- 需要扫码 / 撞人机验证时，自动把浏览器窗口摆到桌面 `(80,60)` 并置顶
+  （`browser.window_on_login`，默认开）。CDP 只能挪位不能置顶，补了 Win32
+  `SetWindowPos`（TOPMOST → NOTOPMOST 两步，抢焦点但不永久钉住）
+- 新增 `/dy show`（别名 `/dy 窗口`、`/dy 打开`、`/dy 前台`）：随时把窗口调出来，
+  回报屏幕坐标与当前登录身份
+- `/dy login` 改成「先摆窗口，再发二维码图」：窗口里的码会自己刷新，
+  聊天里那张约 1 分钟过期，所以优先在窗口里扫
+- 新增 `DouyinBrowser.window_rect()` / `focus_window()`：按进程名 + 标题认窗口
+
+实测：`quiet_window=True` 起在 `(-26214,-26214,1554,882)`，`show_window()` 后
+`(80,60,1280,882)`，`focus_window()` 命中「抖音-记录美好生活 - 个人 - Microsoft Edge」。
+
 ## 0.8.1 — 2026-11-04
 
 **粘贴式 cookie（`browser.cookie_string`）**
