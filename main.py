@@ -68,7 +68,8 @@ HELP_TEXT = """/dy            状态与用法
 /dy start      排一轮到后台（立刻返回，跑完推给你）
 /dy start 2    挑 2 条
 /dy loop on|off  后台自动刷
-/dy login      发一张登录二维码到聊天里，扫完自己继续
+/dy login      把窗口摆到桌面上 + 发一张二维码，扫完自己继续
+/dy show       把抖音浏览器窗口调到桌面并置顶（随时可用）
 /dy push       把当前会话设为简报推送目标
 /dy push 群482755644   固定推到某个群
 /dy push 1931855425    固定推到某个 QQ（私聊）
@@ -103,6 +104,12 @@ SUB_ALIASES = {
     "开始": "start",
     "下一轮": "start",
     "登录": "login",
+    "窗口": "show",
+    "打开": "show",
+    "前台": "show",
+    "界面": "show",
+    "window": "show",
+    "show": "show",
     "推送": "push",
     "分享": "share",
     "转发": "share",
@@ -601,11 +608,27 @@ class DouyinLearningBot(Star):
             return False
         self._login_notice_at = now
 
+        # 先把窗口摆到桌面上：截图里的码 1 分钟就过期，窗口里的码会自己刷新，
+        # 而且人还能在窗口里干别的（选账号、过验证、看报错）。
+        shown = False
+        if getattr(self.settings, "window_on_login", True):
+            shown = await self.browser.show_window()
+            if not shown:
+                logger.warning("登录时没能把窗口摆到桌面")
+
         qr: Path | None = None
         if self.settings.login_qr:
             qr = await self.browser.login_qr(self.work_dir / "login_qr.png")
         wait_min = max(1, self.settings.login_wait_min)
-        if qr:
+        if qr and shown:
+            tip = (
+                "需要登录抖音才能继续刷。\n"
+                "浏览器窗口我已经摆到你桌面上了（置顶）——在里面点右上角「登录」扫码最稳，"
+                "窗口里的码会自己刷新。\n"
+                f"下面这张图也能扫，但大约 1 分钟就过期（{wait_min} 分钟内我都在等）。\n"
+                "扫完不用回话，我会自己发现并继续；超时这轮先跳过，下轮再叫你。"
+            )
+        elif qr:
             tip = (
                 "需要登录抖音才能继续刷。\n"
                 f"二维码在下面这张图里，用抖音 App 扫它（{wait_min} 分钟内有效）。\n"
@@ -614,7 +637,7 @@ class DouyinLearningBot(Star):
         else:
             tip = (
                 "需要登录抖音才能继续刷，但这轮没截到二维码图。\n"
-                "发一句 /dy login 再试一次；要是还不行，把面板里 browser.quiet_window 关掉，"
+                "发一句 /dy login 再试一次（它会把窗口摆到桌面上）；也可以直接发 /dy show 调窗口。"
                 "窗口会出现在桌面上，直接在窗口里扫码。\n"
                 f"我在这儿等 {wait_min} 分钟。"
             )
@@ -1088,16 +1111,38 @@ class DouyinLearningBot(Star):
 
         if sub == "login":
             if await self.browser.logged_in(launch=False):
-                yield event.plain_result("已经是登录状态了，不用再扫。")
+                yield event.plain_result(
+                    "已经是登录状态了，不用再扫。\n"
+                    "想看浏览器长什么样：/dy show（会把窗口调到桌面并置顶）"
+                )
                 return
-            yield event.plain_result(
-                "正在要一张登录二维码…（浏览器窗口可能被挪到屏幕外了，所以直接看图扫）"
-            )
+            yield event.plain_result("正在把浏览器窗口摆到桌面上，顺便要一张二维码…")
+            shown = await self.browser.show_window()
             qr = await self.browser.login_qr(self.work_dir / "login_qr.png")
+            if shown:
+                rect = self.browser.window_rect()
+                where = (
+                    f"（窗口在屏幕 {rect[0]},{rect[1]}，{rect[2]}×{rect[3]}）"
+                    if rect[0] is not None else ""
+                )
+                yield event.plain_result(
+                    f"窗口已经摆到桌面上了{where}，直接在窗口里点右上角「登录」→ 扫码更稳\n"
+                    "——窗口里的二维码会自己刷新，聊天里这张约 1 分钟就过期。"
+                )
             if qr is None:
-                yield event.plain_result("二维码没截到，试试 /dy status 看看浏览器是不是没起来，再重来一次")
+                yield event.plain_result(
+                    "二维码没截到，但窗口已经开出来了：直接在窗口里扫码就行。\n"
+                    "窗口还是找不到就发 /dy show 再叫一次。"
+                )
+                wait_min0 = max(1, self.settings.login_wait_min)
+                ok0 = await self.browser.wait_login(timeout_s=wait_min0 * 60)
+                if ok0:
+                    self._login_notice_at = 0.0
+                    yield event.plain_result("登录成功，登录态已存进 profile，下轮不用再扫。")
+                else:
+                    yield event.plain_result(f"等了 {wait_min0} 分钟没检测到登录，下轮再叫你。")
                 return
-            chain = MessageChain([Plain("用抖音 App 扫这张二维码登录，扫完回一句 /dy status 就行：")])
+            chain = MessageChain([Plain("也可以在聊天里扫这张（约 1 分钟有效）：")])
             chain.chain.append(Image.fromFileSystem(str(qr)))
             yield chain
             wait_min = max(1, self.settings.login_wait_min)
@@ -1110,6 +1155,28 @@ class DouyinLearningBot(Star):
                 yield event.plain_result(
                     "还没检测到登录。二维码过期的话再发 /dy login，它会重新截一张。"
                 )
+            return
+
+        if sub in {"show", "window", "open"}:
+            shown = await self.browser.show_window()
+            if not shown:
+                yield event.plain_result(
+                    "没能把窗口摆出来（浏览器可能没起来）。\n"
+                    "先发 /dy status 看状态；要还是不行，把面板 browser.quiet_window 关掉再试。"
+                )
+                return
+            rect = self.browser.window_rect()
+            who = await self.browser.whoami()
+            line = (
+                f"窗口已经摆到桌面上并置顶了：屏幕 {rect[0]},{rect[1]}，{rect[2]}×{rect[3]}"
+                if rect[0] is not None
+                else "窗口已经调用出来了（拿不到坐标，看任务栏）"
+            )
+            if who:
+                line += f"\n当前登录：{who.get('nick')}"
+            else:
+                line += "\n当前还没登录（窗口里点右上角「登录」扫码，或用 /dy login）"
+            yield event.plain_result(line)
             return
 
         if sub == "account":
