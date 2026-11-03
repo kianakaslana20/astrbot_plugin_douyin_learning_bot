@@ -1254,3 +1254,47 @@ feed 里挑到的卡片不都能开。`/video/<id>` 落到 `data-e2e="error-page
 | @ 评论（缓存路径） | `已发布（cid=7704067476850328335）`，@ 已带上，随后删除成功 |
 | 分享 | 面板行按钮显示「捎句话」（已分享，可再补一句） |
 
+## 21. 窗口前台化（v0.8.2）
+
+### 21.1 问题
+
+`quiet_window` 把窗口放在 `(-32000,-32000)`，后台跑是不抢焦点了，
+但**人要动手时找不到窗口**：扫码、拖滑块、看页面报错全做不了。
+`/dy login` 早期只发一张截图——而截图里的二维码约 1 分钟就过期，扫不及。
+
+### 21.2 三条路径
+
+| 触发 | 动作 | 配置 |
+|---|---|---|
+| 需要扫码登录 | `show_window()` + 置顶，然后才截图发图 | `browser.window_on_login` |
+| 撞人机验证 | 同上，文案说「去窗口里拖一下」 | `notify.verify_wait_min` |
+| 用户主动 | `/dy show` | 无 |
+
+### 21.3 置顶为什么要 Win32
+
+CDP 的 `Browser.setWindowBounds` 只能改位置/尺寸/最小化状态，
+**没有 z-order / always-on-top**。浏览器被终端或编辑器挡住时，挪了等于没挪。
+所以补了 `focus_window()`：`EnumWindows` → 按 `GetWindowThreadProcessId` +
+`QueryFullProcessImageNameW` 认进程（`msedge.exe` / `chrome.exe`）→ 标题含「抖音」
+→ `ShowWindow(SW_RESTORE)` → `SetWindowPos(HWND_TOPMOST)` → `SetWindowPos(HWND_NOTOPMOST)`
+→ `SetForegroundWindow`。两步 SetWindowPos 的用处：抢到焦点，但不永久钉在最上层。
+
+### 21.4 实测
+
+```
+起完了，屏外窗口坐标： (-26214, -26214, 1554, 882)
+show_window = True
+摆回来之后的坐标：   (80, 60, 1280, 882)
+focus_window 命中：  抖音-记录美好生活 - 个人 - Microsoft Edge
+```
+
+（用干净 profile 测的：线上 profile 被 AstrBot 里的插件进程占着，Playwright 起第二个会
+撞「请在已运行的浏览器会话中打开」然后退回 chromium，窗口机制本身跟登录态无关。）
+
+### 21.5 剩下的坑
+
+- 多显示器、缩放不是 100% 时 `window_rect()` 拿到的是物理像素，跟肉眼位置略有出入
+- 窗口被用户手动最小化后，`show_window` 能还原；但如果是被 `moveWindow` 到别的工作区就未必
+- 浏览器进程名不在 `msedge.exe` / `chrome.exe` 里（比如 chromium for testing）时认不到，
+  这时只靠 CDP 挪位，不置顶
+
