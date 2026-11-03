@@ -1298,3 +1298,78 @@ focus_window 命中：  抖音-记录美好生活 - 个人 - Microsoft Edge
 - 浏览器进程名不在 `msedge.exe` / `chrome.exe` 里（比如 chromium for testing）时认不到，
   这时只靠 CDP 挪位，不置顶
 
+## 22. profile 内核锁（v0.8.3）
+
+### 22.1 事故复盘
+
+时间线（2026-11-04）：
+
+| 时刻 | 事件 |
+|---|---|
+| 06:28 | `用 msedge 内核启动失败（TargetClosedError），退回 Playwright 自带 chromium` |
+| 06:47 | 同上，且 **fallback 落在同一个 `profiles/小号/msedge` 目录** → 目录里混入 chromium 的写入 |
+| 07:12 | 该目录又用 msedge 打开（能开），但登录态已失效 |
+| 07:26 | `/user/profile/self/` 回 `{"status_code":8,"status_msg":"用户未登录"}`，cookie 一个不少 |
+
+两个独立问题被混在一起：
+
+1. **TargetClosedError**：Edge 不允许同一 `user-data-dir` 开第二个实例。当时有另一个进程占着这份 profile。
+2. **登录态失效**：同一 `sessionid` 在多个 profile 副本（`pk/a`、`pk/b`、`pk/c`）里被并发使用，
+   抖音服务端吊销了旧会话。
+
+### 22.2 误判复盘（写下来防再犯）
+
+```
+sqlite> select name, length(value) from cookies where name='sessionid';
+sessionid|0
+```
+
+看到 0 就判定「被清零」是错的：Chromium 把明文的 `value` 留空，密文在 `encrypted_value`。
+正确读法是 `context.cookies()`（Playwright 解密后返回 32 字符的 sessionid），
+或者 `length(encrypted_value)`（v10 前缀 + AES-GCM 密文，几十到几百字节）。
+
+### 22.3 三条防护
+
+```python
+# douyin/browser.py
+def _guard_kernel(self):
+    # 1) headless 不许碰真实 profile
+    # 2) lock 里的 channel 与本次要求不同 → raise ProfileKernelMismatch
+```
+
+- `channel.lock` 内容：`{"channel": "msedge", "fingerprint": "3e9a98f3b909ffd5", "at": "...", "version": 1}`
+- `fingerprint = sha1(sorted(args) + locale + viewport + tz + channel)[:16]`
+- 参数微调（比如改 `quiet_window`）不会拦，只看内核；内核不同直接停手
+
+fallback：
+
+```python
+fb_dir = self.profile_dir.with_name(self.profile_dir.name + "-chromium")
+```
+
+### 22.4 验收数据
+
+```
+logged_in = True
+session_info: {'has_session': True, 'sessionid_len': 32, 'ttwid': True, 'csrf': True, 'channel': 'msedge', 'expired': False}
+whoami: {'code': 0, 'nick': '大肥鱼Yume', 'uid': '4330304429101319'}
+取流条数: 51
+评论: True | 已发布（cid=7704088579237298994）；@ 已带上（yezheyue）
+删除: True | 已删除
+```
+
+清空前的备份：`profiles/小号.bak.20261104`（555.9 MB / 4502 文件）。
+
+### 22.5 窗口侧的两个坑（同批修）
+
+1. 隐藏窗口继承：DSH shell 是隐藏的，Playwright 拉起的 Edge 继承 `SW_HIDE`，
+   `IsWindowVisible=false` 但 CDP 认为窗口在 `(80,60)`。认窗口不再按可见性过滤，命中后 `ShowWindow(SW_SHOWNORMAL)`。
+2. `OpenProcess(QUERY_LIMITED_INFORMATION)` 对浏览器进程可能 `Access denied`，
+   取不到 exe 就按标题（含「抖音」）兜底。
+
+### 22.6 还没解决的
+
+- 同一 `sessionid` 仍可能被别的设备/副本顶掉；`channel.lock` 只防本机目录混写，防不了服务端吊销
+- 每日 6 小时短会话（`sid_guard` 有效期 21600）确实是抖音会下发的，靠 `keepalive` 续；
+  长会话（5184000 = 60 天）要看它给不给
+
