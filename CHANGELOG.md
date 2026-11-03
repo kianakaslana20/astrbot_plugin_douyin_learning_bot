@@ -2,6 +2,36 @@
 
 版本号规则：`主.次.修订`。次版本号进位 = 有新能力或有不兼容的配置变化，修订号 = 修 bug / 调参数。
 
+## 0.8.0 — 2026-11-04
+
+**换 Edge 内核 + 把「cookie 从哪来」讲清楚**
+
+- `browser.channel` 默认 `msedge`：用本机 Edge 跑，起不来自动退回自带 chromium
+  （日志会写「用 msedge 内核启动失败（…），退回 Playwright 自带 chromium」）
+- **profile 按内核分目录**：`profiles/<号>/msedge` 与 `profiles/<号>/chromium`。
+  原因：Chromium 写过的目录直接给 Edge 用会以 `exitCode=2147483651`
+  （STATUS_BREAKPOINT）崩掉，日志里是
+  `content_settings_pref.cc:319 Invalid pattern strings: chrome://omnibox-popup.top-chrome/,*`；
+  删 `Local State`、删 `Preferences` 都不救，空目录才正常。老目录里的登录态会自动搬一次。
+- 新增 `douyin/cookies.py`：从本机 Edge/Chrome 读 cookie（DPAPI 解 `v10`）。
+  `v20`（App-Bound Encryption）解不开，会明确报错而不是静默失败。
+- 新增 `/dy cookie`（别名 `cookie` / `登录态` / `ck`）：打印登录态、身份、sessionid 长度、
+  `sid_guard` 剩余时间、ttwid/csrf、内核、上次复核与上次保活；`/dy cookie import edge` 现场搬。
+- 新增 `browser.cookie_source`（auto/edge/chrome/profile）与 `browser.cookie_keepalive_min`（默认 20）：
+  登录态丢了先试着从本机浏览器借，借不到才叫你扫码；平时按间隔做首页心跳。
+- **`sid_guard` 解析修正**：`hash|签发时间|有效期秒数|过期日期`，第 2 段不是过期时间，
+  第 4 段才是。早先按第 2 段算会把刚登录的会话判成「已过期」。
+- 登录态判定现在同时看 `/user/profile/self/` 与 `sid_guard` 到期时间；快到期直接按需要登录处理，
+  触发「搬窗口 + 发二维码」那条求助流程。
+- `_open_video` 校验页面：`data-e2e="error-page"` 或没有播放器就换 `?modal_id=` 入口重试，
+  再不行跳过这条。以前这种情况会一路走到「评论编辑器没出来（视频可能关闭了评论）」，
+  让人以为是评论关了。
+- 分享面板行名去掉「 分享」后缀（以前缓存键会变成 `yezheyue 分享`）；
+  刮到 uid 就落盘 `work/uid_cache.json`，之后 @ 人不用再开视频页。
+- 界面发评论时挂 `response` 钩子接 `/comment/publish/` 的回包，把 cid 捡回来（以前界面路径拿不到 cid，删不掉）。
+- 评论被要求二次验证（`second-verify-mask`）时按人机验证处理：搬窗口 + 叫你，而不是只回一句失败。
+- 实测（Edge 内核，真实 profile）：取流 69 条/15.2s、下载 17.0MB、点赞与取消、分享、@ 评论带 cid 并删除成功。
+
 ## 0.7.0 — 2026-11-04
 
 **发布到 GitHub + 自带更新检查**
