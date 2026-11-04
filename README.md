@@ -748,3 +748,28 @@ MIT，见 [LICENSE](LICENSE)。
 自己的消息服务端也会推回来一条（`sender` 是自己），当成新私信就会自己回自己。现在
 `_ws_self_echo()` 三条判据（自聊会话 / `dm_self_names` 命中 / uid 对上）任一命中就只落证据、
 记 `self_echo`，不提升不回。
+
+## 四点零七、刷完自动评论（v0.12.0）
+
+以前刷完一轮，写操作全卡在 `/dy do`：简报末尾一句「这条要分享/评论吗」，你不回就不发。
+现在评论和点赞按单项开关直接执行，只有分享还问。
+
+| 配置 | 位置 | 现在的作用 |
+|---|---|---|
+| `action_mode` | actions | 总闸门：`off` 一类都不做；`auto` 三类全自动；`ask` 交给下面两个单项开关 |
+| `auto_comment` | actions | 开（默认）→ 刷完直接评论，不再等 `/dy do` |
+| `auto_like` | actions | 开 → 刷完直接点赞；默认关 |
+| `max_actions_per_round` | actions | 一轮最多动几条视频 |
+| `rate_comment_per_day` | rate | 每天评论总上限，到了就只记一行「跳过评论」 |
+
+回执长这样：
+
+```
+写操作回执：
+　已点赞
+　已评论
+
+还有 share 没做：回 /dy do 执行，或 /dy do 跳过
+```
+
+想让分享也别问，把 `action_mode` 改成 `auto`；想全停就改 `off`。
