@@ -41,6 +41,7 @@ try:  # 正常情况：被 AstrBot 当作 data.plugins.<name>.main 加载
     from .douyin.inbox import Entry, Inbox
     from .douyin.jobs import Job, JobQueue
     from .douyin.limits import Limits
+    from .douyin.memory import PersonMemory
     from .douyin.pipeline import Pipeline, RoundResult
     from .douyin.social import ActionResult, Social
     from .douyin.store import Store
@@ -62,6 +63,7 @@ except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录
     from douyin.inbox import Entry, Inbox  # type: ignore
     from douyin.jobs import Job, JobQueue  # type: ignore
     from douyin.limits import Limits  # type: ignore
+    from douyin.memory import PersonMemory  # type: ignore
     from douyin.pipeline import Pipeline, RoundResult  # type: ignore
     from douyin.social import ActionResult, Social  # type: ignore
     from douyin.store import Store  # type: ignore
@@ -179,6 +181,11 @@ class DouyinLearningBot(Star):
         profile = Path(self.settings.profile_dir) if self.settings.profile_dir else self._profile_path()
         self.store = Store(self.data_dir / "dy.db")
         self.limits = Limits(self.data_dir / "dy.db")
+        # 跨平台记忆：自己的 dy.db + 宿主的 data_v4.db（读 QQ 那边的历史）
+        self.memory = PersonMemory(
+            self.data_dir / "dy.db", astrbot_db=self.data_dir.parent / "data_v4.db"
+        )
+        self._dm_task: asyncio.Task | None = None
         self.browser = DouyinBrowser(self.settings, Path(profile))
         self.understander = Understander(self.context, self.settings, self.work_dir)
         self.pipeline = Pipeline(
@@ -188,6 +195,7 @@ class DouyinLearningBot(Star):
         self.social = Social(self.browser, self.settings, dump_dir)
         self.voice = Voice(self.context, self.settings)
         self.inbox = Inbox(self.browser, self.settings)
+        self.inbox.sent_lookup = self.memory.recent_me
         self._pending: list[tuple] = []
         self._pending_at: float = 0.0
 
@@ -202,6 +210,7 @@ class DouyinLearningBot(Star):
         self._last_umo = ""
         self._no_target_noticed = False
         self._want_loop = bool(self.settings.enabled and self.settings.loop_enabled)
+        self._ensure_dm_watch()
 
     def _detect_platform(self) -> str:
         """猜一个平台 id（就是 umo 的第一段，比如「大肥鱼」）。"""
@@ -225,6 +234,7 @@ class DouyinLearningBot(Star):
             return
         try:
             self._loop_task = asyncio.create_task(self._auto_loop())
+            self._ensure_dm_watch()
         except RuntimeError:  # 当前没有运行中的事件循环
             pass
 
@@ -246,6 +256,7 @@ class DouyinLearningBot(Star):
         self.social = Social(self.browser, self.settings, dump_dir)
         self.voice = Voice(self.context, self.settings)
         self.inbox = Inbox(self.browser, self.settings)
+        self.inbox.sent_lookup = self.memory.recent_me
         self._login_notice_at = 0.0
 
     async def _prompt_login_window(self, umo: str, name: str, seconds: int = 90) -> bool:
@@ -917,6 +928,74 @@ class DouyinLearningBot(Star):
         await self._notify_text(umo or self._last_umo, text)
         return "看完了，总结发你了" if note else "看完了（模型没给总结，附了原始摘要）"
 
+
+    def _identity_map(self) -> dict[str, str]:
+        """抖音昵称 -> QQ 号。配置写法：一行一条，`大肥鱼Yume=1931855425`。"""
+        raw = getattr(self.settings, "dm_identity", "") or ""
+        out: dict[str, str] = {}
+        for line in raw.replace("，", "\n").replace(",", "\n").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            for sep in ("=", ":", "：", "\t"):
+                if sep in line:
+                    k, v = line.split(sep, 1)
+                    k, v = k.strip(), v.strip()
+                    if k and v.isdigit():
+                        out[k] = v
+                    break
+        return out
+
+    def _qq_of(self, who: str) -> str:
+        table = self._identity_map()
+        if not table:
+            return ""
+        if who in table:
+            return table[who]
+        for k, v in table.items():
+            if k and (k in who or who in k):
+                return v
+        return ""
+
+    async def _dm_watch_loop(self) -> None:
+        """私信守护：每隔 dm_chat_poll_s 秒盯一次，只读私信不看提醒。"""
+        gap = int(getattr(self.settings, "dm_chat_poll_s", 0) or 0)
+        if gap <= 0:
+            return
+        logger.info("私信守护已启动，每 %s 秒一次", gap)
+        while True:
+            try:
+                await asyncio.sleep(gap)
+                if not getattr(self.settings, "dm_chat_enabled", False):
+                    continue
+                page = await self.browser.page()
+                entries = await self.inbox.collect(
+                    page, include_dm=True, include_mentions=False
+                )
+                fresh = []
+                for e in entries or []:
+                    if e.kind != "dm_text":
+                        continue
+                    if await self.store.inbox_add(e.kind, e.key, src=e.src, payload=json.dumps(
+                        {"aweme_id": e.aweme_id, "who": e.who, "text": e.text, "when": e.when},
+                        ensure_ascii=False,
+                    )):
+                        fresh.append(e)
+                for e in fresh:
+                    try:
+                        line = await self._handle_dm_text(e, self._last_umo or "")
+                        logger.info("私信守护：%s", line)
+                    except HumanVerifyNeeded:
+                        logger.warning("私信守护撞到人机验证，暂停这一轮")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("私信守护出错：%s", exc)
+                    await self.store.inbox_done(e.kind, e.key, "watcher")
+            except asyncio.CancelledError:
+                logger.info("私信守护已停止")
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("私信守护循环异常：%s", exc)
+
     async def _handle_dm_text(self, entry: Entry, umo: str) -> str:
         """别人发来一句话：按人格回一句，发回去。"""
         if not getattr(self.settings, "dm_chat_enabled", False):
@@ -925,16 +1004,34 @@ class DouyinLearningBot(Star):
         who = entry.who or ""
         if not allow or not any(a == who or a in who or who in a for a in allow):
             return f"「{who}」不在日常聊天白名单里，不回"
-        why = await self.limits.check_async("dm", self.settings)
-        if why:
-            return f"先不回：{why}"
-        text = await self.voice.chat(their=entry.text or "", umo=umo)
+        free = [
+            x.strip()
+            for x in (getattr(self.settings, "dm_chat_no_limit", "") or "")
+            .replace("，", ",")
+            .split(",")
+            if x.strip()
+        ]
+        unlimited = any(a == who or a in who or who in a for a in free)
+        if not unlimited:
+            why = await self.limits.check_async("dm", self.settings)
+            if why:
+                return f"先不回：{why}"
+        qq_id = self._qq_of(who)
+        memory = self.memory.background(
+            person=who,
+            qq_id=qq_id,
+            limit=int(getattr(self.settings, "dm_chat_history", 6) or 6),
+        )
+        self.memory.remember(who, "them", entry.text or "")
+        text = await self.voice.chat(their=entry.text or "", umo=umo, memory=memory)
         if not text:
             return "没想出合适的回法（模型没给出合格的句子），不硬发"
         ok = await self.send_dm(who, text)
         if not ok:
             return f"回了但没发出去：「{text[:20]}」"
-        await self.limits.hit_async("dm")
+        self.memory.remember(who, "me", text)
+        if not unlimited:
+            await self.limits.hit_async("dm")
         return f"回了：「{text}」"
 
     async def _handle_mention(self, page, entry: Entry, umo: str) -> str:
@@ -1405,6 +1502,7 @@ class DouyinLearningBot(Star):
                 self._want_loop = True
                 self._push_target = self._push_target or event.unified_msg_origin
                 self._loop_task = asyncio.create_task(self._auto_loop())
+                await self.start_dm_watch()
                 yield event.plain_result(
                     f"已开启后台自动刷，每 {self.settings.loop_interval_min} 分钟一轮，"
                     f"推送到 {self._push_target or '（未设置，先 /dy push）'}"
@@ -2121,7 +2219,35 @@ class DouyinLearningBot(Star):
     def _help_text() -> str:
         return "抖音刷视频学习助手·指令\n" + HELP_TEXT
 
+    def _ensure_dm_watch(self) -> None:
+        """同步版：在非 async 的启动路径里也能把守护挂上。"""
+        if self._dm_task and not self._dm_task.done():
+            return
+        if int(getattr(self.settings, "dm_chat_poll_s", 0) or 0) <= 0:
+            return
+        try:
+            self._dm_task = asyncio.create_task(self._dm_watch_loop())
+        except RuntimeError:  # 没有运行中的事件循环
+            self._dm_task = None
+
+    async def start_dm_watch(self) -> None:
+        if self._dm_task and not self._dm_task.done():
+            return
+        if int(getattr(self.settings, "dm_chat_poll_s", 0) or 0) <= 0:
+            return
+        self._dm_task = asyncio.create_task(self._dm_watch_loop())
+
+    async def stop_dm_watch(self) -> None:
+        if self._dm_task and not self._dm_task.done():
+            self._dm_task.cancel()
+            try:
+                await self._dm_task
+            except Exception:  # noqa: BLE001
+                pass
+        self._dm_task = None
+
     async def terminate(self) -> None:
+        await self.stop_dm_watch()
         await self._cancel_loop()
         try:
             await self.jobs.stop()
