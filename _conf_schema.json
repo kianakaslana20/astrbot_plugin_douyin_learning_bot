@@ -428,67 +428,14 @@
         "default": "",
         "description": "额外禁词（逗号分隔）",
         "hint": "内置一份 AI 腔黑名单（首先/其次/综上/这个视频/干货满满…），命中会重写一次。这里补你自己的：比如某个口头禅、某个不能提的词。"
-      },
-      "rate_enabled": {
-        "type": "bool",
-        "default": true,
-        "description": "启用频率限制",
-        "hint": "关掉就是不限次数（不建议）。计数存在 dy.db 里，重载/重启都还在。"
-      },
-      "rate_comment_per_day": {
-        "type": "int",
-        "default": 8,
-        "description": "评论：每天最多几条",
-        "hint": "评论是最贵的一档（要过审）。8 条/天已经很活跃了，20 以上像机器人。"
-      },
-      "rate_share_per_day": {
-        "type": "int",
-        "default": 10,
-        "description": "分享：每天最多几次",
-        "hint": "分享不直接对外发言，但刷屏式转发同样会被盯。"
-      },
-      "rate_like_per_day": {
-        "type": "int",
-        "default": 30,
-        "description": "点赞：每天最多几个",
-        "hint": "点赞最便宜，但一天几百个一样异常。"
-      },
-      "rate_dm_per_hour": {
-        "type": "int",
-        "default": 6,
-        "description": "私信：每小时最多回几条",
-        "hint": "私信回复的节奏是 0.9.x 的功能用的；先在这里定好上限。"
-      },
-      "rate_summary_per_day": {
-        "type": "int",
-        "description": "总结：每天最多写几条（0 = 不写）",
-        "default": 20,
-        "hint": "私信分享来的视频，写一份像人写的总结要跑一遍转写+读图。这条预算就是成本闸门。"
-      },
-      "quiet_hours": {
-        "type": "string",
-        "default": "",
-        "description": "静默时段（例 01:00-08:00）",
-        "hint": "这段时间不发任何评论/分享/点赞/私信。支持跨午夜（23:00-07:00）。半夜秒回是最明显的机器人特征。"
-      },
-      "pending_ttl_hours": {
-        "type": "int",
-        "default": 12,
-        "description": "待确认动作多久作废（小时）",
-        "hint": "ask 模式攒下的分享/评论，超过这么久还没确认就作废——放久了再执行，视频本身都凉了，评论也显得莫名其妙。0 = 不过期。"
-      },
-      "action_jitter": {
-        "type": "bool",
-        "default": true,
-        "description": "动作间隔随机化",
-        "hint": "固定 6 秒一次连着十次，比任何行为都像脚本。开着取 0.6~1.8 倍随机，偶尔更久（像在看手机）。"
-      },
-      "keep_days": {
-        "type": "int",
-        "default": 30,
-        "description": "记录与临时文件保留天数",
-        "hint": "超过这个天数的看片记录、动作日志、下载的视频与拼图会被清掉。0 = 不清理。"
-      },
+      }
+    }
+  },
+  "inbox": {
+    "type": "object",
+    "description": "私信与提醒",
+    "hint": "翻私信里分享来的视频、读 @ 我的提醒、按人格回私信。每条动作都受开关+白名单+频率上限三道约束。",
+    "items": {
       "inbox_dm": {
         "type": "bool",
         "description": "翻私信：别人发来的视频链接",
@@ -548,6 +495,73 @@
         "description": "每次最多回几轮（1~10）",
         "default": 2,
         "hint": "一轮扫描里同一个人最多读到几条消息、最多回几次。"
+      }
+    }
+  },
+  "rate": {
+    "type": "object",
+    "description": "频率与静默",
+    "hint": "所有自动动作的刹车：每天/每小时做几次、几点到几点不动手、攒着的动作多久作废。",
+    "items": {
+      "rate_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "启用频率限制",
+        "hint": "关掉就是不限次数（不建议）。计数存在 dy.db 里，重载/重启都还在。"
+      },
+      "rate_comment_per_day": {
+        "type": "int",
+        "default": 8,
+        "description": "评论：每天最多几条",
+        "hint": "评论是最贵的一档（要过审）。8 条/天已经很活跃了，20 以上像机器人。"
+      },
+      "rate_share_per_day": {
+        "type": "int",
+        "default": 10,
+        "description": "分享：每天最多几次",
+        "hint": "分享不直接对外发言，但刷屏式转发同样会被盯。"
+      },
+      "rate_like_per_day": {
+        "type": "int",
+        "default": 30,
+        "description": "点赞：每天最多几个",
+        "hint": "点赞最便宜，但一天几百个一样异常。"
+      },
+      "rate_dm_per_hour": {
+        "type": "int",
+        "default": 6,
+        "description": "私信：每小时最多回几条",
+        "hint": "私信回复的节奏是 0.9.x 的功能用的；先在这里定好上限。"
+      },
+      "rate_summary_per_day": {
+        "type": "int",
+        "description": "总结：每天最多写几条（0 = 不写）",
+        "default": 20,
+        "hint": "私信分享来的视频，写一份像人写的总结要跑一遍转写+读图。这条预算就是成本闸门。"
+      },
+      "quiet_hours": {
+        "type": "string",
+        "default": "",
+        "description": "静默时段（例 01:00-08:00）",
+        "hint": "这段时间不发任何评论/分享/点赞/私信。支持跨午夜（23:00-07:00）。半夜秒回是最明显的机器人特征。"
+      },
+      "pending_ttl_hours": {
+        "type": "int",
+        "default": 12,
+        "description": "待确认动作多久作废（小时）",
+        "hint": "ask 模式攒下的分享/评论，超过这么久还没确认就作废——放久了再执行，视频本身都凉了，评论也显得莫名其妙。0 = 不过期。"
+      },
+      "action_jitter": {
+        "type": "bool",
+        "default": true,
+        "description": "动作间隔随机化",
+        "hint": "固定 6 秒一次连着十次，比任何行为都像脚本。开着取 0.6~1.8 倍随机，偶尔更久（像在看手机）。"
+      },
+      "keep_days": {
+        "type": "int",
+        "default": 30,
+        "description": "记录与临时文件保留天数",
+        "hint": "超过这个天数的看片记录、动作日志、下载的视频与拼图会被清掉。0 = 不清理。"
       }
     }
   },
