@@ -25,6 +25,7 @@ from typing import Any
 from astrbot.api import logger
 
 from .browser import HumanVerifyNeeded
+from .im import DirectMessages
 
 VIDEO_URL = "https://www.douyin.com/video/{aweme_id}"
 HOME_URL = "https://www.douyin.com/"
@@ -81,6 +82,7 @@ class Social:
         self._uid_cache: dict[str, str] = self._load_uid_cache()
         # 界面发表时顺带把 publish 的回包接住 —— UI 拿不到 cid，但浏览器自己的
         # XHR 里带着 cid。接住它，事后才能删（自测、回滚都要）。
+        self.im = DirectMessages(browser)
         self._cid_hook: list[str] = []
         self._hook_page = None
 
@@ -571,6 +573,32 @@ class Social:
             if head in (it.get("text") or ""):
                 return str(it.get("cid") or "")
         return ""
+
+    async def send_dm(self, target: str, text: str, allow=None, readback=None) -> tuple:
+        target = (target or "").strip()
+        # 会话行上没有 data-userid：拿到纯数字 uid 就先在缓存里换个名字
+        if target.isdigit():
+            for name in list(getattr(self, "_uid_cache", {}) or {}):
+                if self._uid_of(name) == target:
+                    target = name
+                    break
+        """主动发一条私信（对外的统一入口，内部走界面）。
+
+        target: 抖音昵称或纯数字 uid；allow: 白名单（None = 不校验）。
+        """
+        page = await self._browser.page()
+        if readback is None:
+            readback = bool(getattr(self.settings, "dm_readback", True))
+        if allow is None:
+            allow_list = None
+        elif isinstance(allow, (list, tuple)):
+            allow_list = [str(a).strip() for a in allow if str(a).strip()]
+        else:
+            raw = str(allow or "").replace("，", ",").replace("、", ",")
+            allow_list = [x.strip() for x in raw.split(",") if x.strip()]
+        return await self.im.send_dm(
+            page, target, text, allow=allow_list, readback=readback
+        )
 
     async def delete_comment(self, aweme_id: str, cid: str) -> ActionResult:
         """删掉自己刚发的评论（自测/回滚用）。"""
