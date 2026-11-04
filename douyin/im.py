@@ -376,6 +376,23 @@ class Message:
     extra: dict = field(default_factory=dict)
 
 
+BOX_JS = """() => {
+  const direct = document.querySelector('[data-e2e="im-entry"]');
+  const pick = (el) => { const r = el.getBoundingClientRect();
+    return r.width < 4 ? null : {x: r.x + r.width / 2, y: r.y + r.height / 2}; };
+  if (direct) { const b = pick(direct); if (b) return b; }
+  const cands = [];
+  for (const el of document.querySelectorAll('ul,li,span,div,a')) {
+    if ((el.textContent || '').replace(/\\s+/g, '').trim() !== '消息') continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    cands.push({x: r.x + r.width / 2, y: r.y + r.height / 2, area: r.width * r.height});
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => a.area - b.area);
+  return cands[0];
+}"""
+
 CONV_JS = """() => {
   const rows = [...document.querySelectorAll('[data-e2e="conversation-item"]')];
   const out = [];
@@ -512,7 +529,14 @@ class DirectMessages:
             logger.warning("私信：找不到「消息」入口（顶栏没渲染出来）")
             return False
 
-        for attempt in (1, 2, 3):
+        for attempt in (1, 2, 3, 4):
+            if attempt >= 2:
+                # 位置可能变了（顶栏会挤动），也可能有弹层挡着
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(200)
+                fresh = await page.evaluate(BOX_JS)
+                if fresh:
+                    box = fresh
             await page.mouse.move(box["x"] - 30, box["y"])
             await page.wait_for_timeout(400)
             await page.mouse.move(box["x"], box["y"])
@@ -522,6 +546,27 @@ class DirectMessages:
                 await page.wait_for_timeout(500)
                 if await self._panel_visible(page):
                     return True
+            if attempt >= 2:
+                # 真点不管用就交给页面自己派发一次 click（React 的 onClick 同样会收到）
+                try:
+                    await page.evaluate(
+                        """() => {
+                          const el = document.querySelector('[data-e2e="im-entry"]');
+                          if (el) { el.click(); return true; }
+                          for (const n of document.querySelectorAll('ul,li,span,div,a')) {
+                            if ((n.textContent || '').replace(/\\s+/g, '').trim() !== '消息') continue;
+                            const r = n.getBoundingClientRect();
+                            if (r.width > 4 && r.height > 4) { n.click(); return true; }
+                          }
+                          return false;
+                        }"""
+                    )
+                    for _ in range(6):
+                        await page.wait_for_timeout(500)
+                        if await self._panel_visible(page):
+                            return True
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("私信：页面内点「消息」失败（%s）", type(exc).__name__)
             logger.info("私信：第 %s 次点「消息」没开出来，再试", attempt)
         return False
 
