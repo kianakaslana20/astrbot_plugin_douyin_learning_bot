@@ -245,6 +245,9 @@ class Settings:
     inbox_share_summary: bool = True
     inbox_mention_reply: bool = True
     dm_allow: str = ""
+    dm_chat_enabled: bool = False
+    dm_chat_allow: str = ""
+    dm_chat_max: int = 2
     voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
     voice_persona: str = ""        # 人格名；留空 = 用该会话的默认人格
     voice_max_chars: int = 40      # 一条评论多少字以内
@@ -356,6 +359,9 @@ class Settings:
         inbox_share_summary=_as_bool(ac.get("inbox_share_summary"), True),
         inbox_mention_reply=_as_bool(ac.get("inbox_mention_reply"), True),
         dm_allow=_as_str(ac.get("dm_allow"), ""),
+        dm_chat_enabled=_as_bool(ac.get("dm_chat_enabled"), False),
+        dm_chat_allow=_as_str(ac.get("dm_chat_allow"), ""),
+        dm_chat_max=_as_int(ac.get("dm_chat_max"), 2, 0, 10),
         voice_enabled=_as_bool(ac.get("voice_enabled"), True),
             voice_persona=_as_str(ac.get("voice_persona"), ""),
             voice_max_chars=_as_int(ac.get("voice_max_chars"), 40, 6, 200),
