@@ -252,6 +252,12 @@ class Settings:
     dm_chat_poll_s: int = 0,    # >0：每隔这么多秒盯一次私信（0=跟着主循环）
     dm_chat_history: int = 6,   # 带几句上下文
     # 主动发私信（0.9.7）：默认开，但仍受 action_mode 约束（off 一律不发）
+    agent_enabled: bool = True        # 事件回不回交给模型判断
+    event_ws: bool = True             # 用 IM WebSocket 帧当触发信号
+    poll_fallback_min: int = 10       # WS 静默时的兜底轮询间隔（分钟）
+    autonomous_round: bool = True     # 不需要 /dy start 也能自己刷
+    auto_rounds_per_day: int = 4      # 自主刷每天最多几轮
+    auto_items_per_day: int = 8       # 自主刷每天最多看几条
     dm_send_enabled: bool = True
     dm_targets: str = ""            # 只允许发给名单里这些人（空 = 谁都不发）
     dm_quota_separate: bool = True  # True：主动私信单独配额；False：和「回私信」共用一个池
@@ -382,6 +388,12 @@ class Settings:
         dm_chat_poll_s=_as_int(ibx.get("dm_chat_poll_s"), 0, 0, 3600),
         dm_chat_history=_as_int(ibx.get("dm_chat_history"), 6, 0, 20),
         dm_send_enabled=_as_bool(ibx.get("dm_send_enabled"), True),
+        agent_enabled=_as_bool(ibx.get("agent_enabled"), True),
+        event_ws=_as_bool(ibx.get("event_ws"), True),
+        poll_fallback_min=_as_int(ibx.get("poll_fallback_min"), 10, 1, 240),
+        autonomous_round=_as_bool(ibx.get("autonomous_round"), True),
+        auto_rounds_per_day=_as_int(ibx.get("auto_rounds_per_day"), 4, 0, 100),
+        auto_items_per_day=_as_int(ibx.get("auto_items_per_day"), 8, 0, 200),
         dm_targets=_as_str(ibx.get("dm_targets"), ""),
         dm_quota_separate=_as_bool(ibx.get("dm_quota_separate"), True),
         dm_readback=_as_bool(ibx.get("dm_readback"), True),
