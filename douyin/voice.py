@@ -71,6 +71,16 @@ _SUMMARY_RULES = """你要用第一人称给"自己"写一条看完视频后的�
 - emoji 最多两个。"""
 
 
+_REPLY_RULES = """有人在你刷到的视频下面 @ 了你，回他一句，像平时聊天。
+
+要求：
+- 一句话，{max_chars} 字以内，可以先答他的问题再补半句
+- 直接回应他说的事，别绕开、别答非所问
+- 不用敬语，不写「感谢分享」「说得对」这类场面话
+- 不写 @昵称、不写引号、不复述视频标题
+"""
+
+
 class Voice:
     """把「说什么」交给模型和人格，把「怎么发出去」留给 social。"""
 
@@ -279,3 +289,42 @@ class Voice:
         prompt = "\n".join(facts) + "\n\n写这条记录："
         text = self._clean(await self._chat(system, prompt, self._images(frames), umo))
         return text[: max_chars * 2]
+
+    async def reply(
+        self,
+        *,
+        their: str,
+        title: str = "",
+        analysis_summary: str = "",
+        frames: list[str] | None = None,
+        umo: str = "",
+    ) -> str:
+        """回一条别人 @ 我的评论。要接住对方那句话，不像客服。"""
+        max_chars = self._max_chars(40)
+        persona = await self.persona_prompt(umo)
+        system = (persona + "\n\n" if persona else "") + _REPLY_RULES.format(
+            max_chars=max_chars
+        )
+        facts = []
+        if their:
+            facts.append(f"对方说的：{their[:200]}")
+        if title:
+            facts.append(f"视频标题：{title[:120]}")
+        if analysis_summary:
+            facts.append(f"视频讲了什么：{analysis_summary[:300]}")
+        prompt = "\n".join(facts) + "\n\n回他一句："
+        for attempt in range(2):
+            raw = await self._chat(
+                system if attempt == 0 else system + "\n（上一条太客气了，像聊天那样再说一句）",
+                prompt,
+                self._images(frames),
+                umo,
+            )
+            text = self._clean(raw)
+            if not text:
+                break
+            why = self.check(text)
+            if not why:
+                return text[:120]
+            logger.info("回评不合格（%s）：%s", why, text[:40])
+        return ""
