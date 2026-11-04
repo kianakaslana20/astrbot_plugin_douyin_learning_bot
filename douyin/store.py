@@ -75,6 +75,26 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_key ON inbox(kind, key);
 CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(handled_at, seen_at DESC);
 
+CREATE TABLE IF NOT EXISTS dm_judge (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    from_nick TEXT NOT NULL,
+    content TEXT DEFAULT '',
+    decision TEXT DEFAULT '',
+    reason TEXT DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_judge_time ON dm_judge(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS reply_cool (
+    kind TEXT NOT NULL,
+    who TEXT NOT NULL,
+    ts REAL NOT NULL,
+    count INTEGER DEFAULT 1,
+    PRIMARY KEY (kind, who)
+);
+
 -- 私信发件箱：主动发出去的每一条都要留档。
 -- 为什么单独一张表而不是塞进 event：这条记录要能被 /dy confirm 捞出来、被重试、
 -- 被事后追查「到底发没发出去」，event 是流水，不适合当状态机。
@@ -165,6 +185,98 @@ class Store:
 
     async def inbox_stats(self) -> dict:
         return await asyncio.to_thread(self._inbox_stats_sync)
+
+    # ------------------------------------------------------------ 判断记录
+    def _judge_add_sync(self, event_id: str, type_: str, from_nick: str,
+                        content: str, decision: str, reason: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO dm_judge(event_id, type, from_nick, content, decision, reason, created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (event_id, type_, from_nick, content[:600], decision, reason[:300], time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    async def judge_add(self, event_id: str, type_: str, from_nick: str,
+                        content: str = "", decision: str = "", reason: str = "") -> int:
+        return await asyncio.to_thread(
+            self._judge_add_sync, event_id, type_, from_nick, content, decision, reason
+        )
+
+    def _judge_recent_sync(self, limit: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM dm_judge ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def judge_recent(self, limit: int = 10) -> list[dict]:
+        return await asyncio.to_thread(self._judge_recent_sync, limit)
+
+    def _judge_stats_sync(self) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT decision, COUNT(*) c FROM dm_judge GROUP BY decision"
+            ).fetchall()
+        return {r["decision"] or "?": int(r["c"]) for r in rows}
+
+    async def judge_stats(self) -> dict:
+        return await asyncio.to_thread(self._judge_stats_sync)
+
+    # ------------------------------------------------------------ 回话冷却
+    def _cool_left_sync(self, kind: str, who: str, hours: float) -> float:
+        if hours <= 0:
+            return 0.0
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT ts FROM reply_cool WHERE kind=? AND who=?", (kind, who or "")
+            ).fetchone()
+        if not row:
+            return 0.0
+        left = float(row["ts"]) + hours * 3600 - time.time()
+        return left if left > 0 else 0.0
+
+    async def cool_left(self, kind: str, who: str, hours: float) -> float:
+        """这个人还要等多少秒才能再回（0 = 现在就能回）。"""
+        return await asyncio.to_thread(self._cool_left_sync, kind, who, hours)
+
+    def _cool_hit_sync(self, kind: str, who: str) -> int:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO reply_cool(kind, who, ts, count) VALUES(?,?,?,1)
+                   ON CONFLICT(kind, who) DO UPDATE SET ts=excluded.ts, count=reply_cool.count+1""",
+                (kind, who or "", now),
+            )
+            row = conn.execute(
+                "SELECT count FROM reply_cool WHERE kind=? AND who=?", (kind, who or "")
+            ).fetchone()
+        return int(row["count"]) if row else 1
+
+    async def cool_hit(self, kind: str, who: str) -> int:
+        """记一次「刚回过他」，返回累计回过几次。"""
+        return await asyncio.to_thread(self._cool_hit_sync, kind, who)
+
+    def _cool_reset_sync(self, kind: str, who: str) -> int:
+        with self._connect() as conn:
+            if who:
+                cur = conn.execute("DELETE FROM reply_cool WHERE kind=? AND who=?", (kind, who))
+            else:
+                cur = conn.execute("DELETE FROM reply_cool WHERE kind=?", (kind,))
+            return int(cur.rowcount or 0)
+
+    async def cool_reset(self, kind: str, who: str = "") -> int:
+        return await asyncio.to_thread(self._cool_reset_sync, kind, who)
+
+    def _cool_list_sync(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, who, ts, count FROM reply_cool ORDER BY ts DESC LIMIT 30"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def cool_list(self) -> list[dict]:
+        return await asyncio.to_thread(self._cool_list_sync)
 
     # ------------------------------------------------------------ 私信发件箱
 
