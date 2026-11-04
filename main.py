@@ -178,7 +178,7 @@ class DouyinLearningBot(Star):
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
-        profile = Path(self.settings.profile_dir) if self.settings.profile_dir else self._profile_path()
+        profile = self._resolve_profile()
         self.store = Store(self.data_dir / "dy.db")
         self.limits = Limits(self.data_dir / "dy.db")
         # 跨平台记忆：自己的 dy.db + 宿主的 data_v4.db（读 QQ 那边的历史）
@@ -186,6 +186,7 @@ class DouyinLearningBot(Star):
             self.data_dir / "dy.db", astrbot_db=self.data_dir.parent / "data_v4.db"
         )
         self._dm_task: asyncio.Task | None = None
+        self._dm_err_at: float = 0.0
         self.browser = DouyinBrowser(self.settings, Path(profile))
         self.understander = Understander(self.context, self.settings, self.work_dir)
         self.pipeline = Pipeline(
@@ -246,7 +247,7 @@ class DouyinLearningBot(Star):
             await self.browser.close()
         except Exception as exc:  # noqa: BLE001
             logger.warning("关旧浏览器失败：%s", exc)
-        profile = self._profile_path()
+        profile = self._resolve_profile()
         profile.mkdir(parents=True, exist_ok=True)
         self.browser = DouyinBrowser(self.settings, Path(profile))
         self.pipeline = Pipeline(
@@ -383,6 +384,41 @@ class DouyinLearningBot(Star):
         """内核标签：不同内核的 profile 不能混用（实测 Edge 读 chromium 写的库会直接崩）。"""
         chan = (getattr(self.settings, "channel", "") or "").strip().lower()
         return {"": "chromium", "msedge": "msedge", "chrome": "chrome"}.get(chan, chan or "chromium")
+
+    def _resolve_profile(self) -> Path:
+        """决定这次到底用哪个目录。
+
+        settings.profile_dir 是"人填的"，很容易填到基目录（比如 profiles\小号），
+        而那里可能是另一个内核写过的 —— 直接用它会被 channel.lock 拦住，
+        表现为「窗口不出来、私信也没动静」。这里做一次无害的纠正：
+        基目录带着别的内核锁、而 <内核> 子目录确实存在 → 用子目录。
+        """
+        raw = (getattr(self.settings, "profile_dir", "") or "").strip()
+        if not raw:
+            return self._profile_path()
+        p = Path(raw).expanduser()
+        tag = self._chan_tag()
+        if p.name.lower() == tag:
+            return p
+        other = ""
+        lock = p / "channel.lock"
+        if lock.exists():
+            try:
+                other = str(json.loads(lock.read_text("utf-8")).get("channel") or "")
+            except Exception:  # noqa: BLE001
+                other = ""
+        sub = p / tag
+        if other and other != tag and sub.exists():
+            logger.warning(
+                "profile_dir 指到了 %s 目录（那份是 %s 写的），当前内核是 %s，"
+                "自动改用 %s/%s 启动（不动原目录）",
+                p.name, other, tag, p.name, tag,
+            )
+            return sub
+        if not other and (sub / "Default").exists():
+            logger.info("profile_dir 没带内核标签，按内核自动落到 %s", sub)
+            return sub
+        return p
 
     def _profile_base(self, name: str | None = None) -> Path:
         """一个号一份基目录（不带内核标签）。"""
@@ -969,6 +1005,12 @@ class DouyinLearningBot(Star):
                 if not getattr(self.settings, "dm_chat_enabled", False):
                     continue
                 page = await self.browser.page()
+                try:
+                    if "douyin.com" not in (page.url or ""):
+                        await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=45000)
+                        await page.wait_for_timeout(1200)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("私信守护：回首页没成功（%s），接着试", type(exc).__name__)
                 entries = await self.inbox.collect(
                     page, include_dm=True, include_mentions=False
                 )
@@ -981,6 +1023,9 @@ class DouyinLearningBot(Star):
                         ensure_ascii=False,
                     )):
                         fresh.append(e)
+                logger.info(
+                    "私信守护：本轮读到 %s 条私信内容，新 %s 条", len(entries or []), len(fresh)
+                )
                 first = not getattr(self, "_dm_warmed", False)
                 self._dm_warmed = True
                 for e in fresh:
@@ -993,6 +1038,15 @@ class DouyinLearningBot(Star):
                         logger.info("私信守护：%s", line)
                     except HumanVerifyNeeded:
                         logger.warning("私信守护撞到人机验证，暂停这一轮")
+                    except (ProfileKernelMismatch, DouyinBlocked) as exc:
+                        logger.warning("私信守护起不来：%s", exc)
+                        now = time.time()
+                        if now - getattr(self, "_dm_err_at", 0) > 600:
+                            self._dm_err_at = now
+                            await self._ask_help(
+                                f"抖音那边停了：{exc}\n"
+                                "私信现在收不到，处理完发一句 /dy start 或 /dy show 就行。"
+                            )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("私信守护出错：%s", exc)
                     await self.store.inbox_done(e.kind, e.key, "watcher")
@@ -1000,7 +1054,15 @@ class DouyinLearningBot(Star):
                 logger.info("私信守护已停止")
                 return
             except Exception as exc:  # noqa: BLE001
-                logger.warning("私信守护循环异常：%s", exc)
+                logger.warning(
+                        "私信守护循环异常：%s（目录=%s 锁=%s 内核=%s）",
+                        exc,
+                        getattr(self.browser, "profile_dir", "?"),
+                        (self.browser.channel_lock.read_text("utf-8").strip()
+                         if getattr(self.browser, "channel_lock", None)
+                         and self.browser.channel_lock.exists() else "无"),
+                        getattr(self.settings, "channel", "?"),
+                    )
 
     async def _handle_dm_text(self, entry: Entry, umo: str) -> str:
         """别人发来一句话：按人格回一句，发回去。"""
