@@ -131,6 +131,13 @@ class DouyinBrowser:
                     "--disable-backgrounding-occluded-windows",
                 ]
             )
+        else:
+            # 要人看得见：**显式给坐标**。不给的话 Edge 会从 profile 里恢复上次
+            # 记住的位置（我们之前把它放到 -32000），最后落在屏幕左边界外，
+            # 表现就是「窗口起来了但我看不见」。
+            launch_kwargs["args"].extend(
+                ["--window-position=80,60", "--window-size=1280,900"]
+            )
         if self.settings.channel:
             launch_kwargs["channel"] = self.settings.channel
         try:
@@ -140,8 +147,27 @@ class DouyinBrowser:
             self.channel_used = self.settings.channel or "chromium"
             self.profile_used = self.profile_dir
             self._write_lock(self.channel_used, launch_kwargs.get("args", []), launch_kwargs)
+            if not getattr(self.settings, "quiet_window", True):
+                # 窗口可能被 profile 记住的「最小化」状态带进去（rect 会是 -25600），
+                # 起来了但人看不见 —— 主动还原一次。
+                try:
+                    _page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
+                    await self.show_window(_page)
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as exc:  # 目录被上一个进程占用等
             # 通道不可用（比如这台机器没装 Edge）就退回自带 chromium，别把整轮搞死
+            if launch_kwargs.pop("channel", None) and getattr(
+                self.settings, "channel_strict", False
+            ):
+                # 严格模式：内核必须跟桌面一致，不偷偷换 —— 换内核等于换指纹，
+                # 抖音那边看到的浏览器变了，登录态和风控状态都不是一回事。
+                await self._shutdown_playwright()
+                raise DouyinBlocked(
+                    f"{self.settings.channel} 内核起不来（{type(exc).__name__}: {exc}）。"
+                    f"channel_strict 开着，不退回 chromium。"
+                    f"常见原因：Edge 正开着同一个 profile，或 profile 被别的进程占着。"
+                ) from exc
             if launch_kwargs.pop("channel", None):
                 # 关键：**换目录**。同一个目录被两种内核写过，下次谁都开不了
                 fb_dir = self.profile_dir.with_name(self.profile_dir.name + "-chromium")
