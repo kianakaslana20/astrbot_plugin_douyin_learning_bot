@@ -524,6 +524,24 @@
         "description": "私信白名单（逗号分隔，空=不限）",
         "default": "",
         "hint": "/dy dm 只能发给名单里的人"
+      },
+      "dm_chat_enabled": {
+        "type": "bool",
+        "description": "私信日常聊天：别人发文字就按人格回一句",
+        "default": false,
+        "hint": "关着的时候私信只读不回。开了也只在下面白名单里的人身上生效，并且受「私信每小时」上限约束。"
+      },
+      "dm_chat_allow": {
+        "type": "text",
+        "description": "日常聊天白名单（昵称，逗号分隔）",
+        "default": "",
+        "hint": "留空 = 谁都不回。写「yezheyue,老张」就只回这两个人的私信。"
+      },
+      "dm_chat_max": {
+        "type": "int",
+        "description": "每次最多回几轮（1~10）",
+        "default": 2,
+        "hint": "一轮扫描里同一个人最多读到几条消息、最多回几次。"
       }
     }
   },
