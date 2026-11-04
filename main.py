@@ -993,6 +993,19 @@ class DouyinLearningBot(Star):
                 return v
         return ""
 
+    def _window_needs_restore(self) -> bool:
+        """窗口跑到屏幕外/被最小化了吗（只在 quiet_window 关掉时有意义）。"""
+        if getattr(self.settings, "quiet_window", True):
+            return False
+        try:
+            left, top, w, h = self.browser.window_rect()
+        except Exception:  # noqa: BLE001
+            return False
+        if left is None:
+            return False
+        # 最小化态的典型样子：位置 -25600、只剩标题栏 159x27
+        return left < -3000 or top < -3000 or w <= 260 or h <= 120
+
     async def _dm_watch_loop(self) -> None:
         """私信守护：每隔 dm_chat_poll_s 秒盯一次，只读私信不看提醒。"""
         gap = int(getattr(self.settings, "dm_chat_poll_s", 0) or 0)
@@ -1011,6 +1024,12 @@ class DouyinLearningBot(Star):
                         await page.wait_for_timeout(1200)
                 except Exception as exc:  # noqa: BLE001
                     logger.info("私信守护：回首页没成功（%s），接着试", type(exc).__name__)
+                if self._window_needs_restore():
+                    try:
+                        await self.browser.show_window(page)
+                        logger.info("窗口被最小化或挪出屏幕，已经还原")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.info("窗口还原没成功（%s）", type(exc).__name__)
                 entries = await self.inbox.collect(
                     page, include_dm=True, include_mentions=False
                 )
