@@ -251,6 +251,11 @@ class Settings:
     dm_chat_no_limit: str = "",  # 这些人私聊不限次数（逗号分隔）
     dm_chat_poll_s: int = 0,    # >0：每隔这么多秒盯一次私信（0=跟着主循环）
     dm_chat_history: int = 6,   # 带几句上下文
+    # 主动发私信（0.9.7）：默认开，但仍受 action_mode 约束（off 一律不发）
+    dm_send_enabled: bool = True
+    dm_targets: str = ""            # 只允许发给名单里这些人（空 = 谁都不发）
+    dm_quota_separate: bool = True  # True：主动私信单独配额；False：和「回私信」共用一个池
+    dm_readback: bool = True        # 发完回读校验，false 只是不校验
     dm_identity: str = ""
     dm_self_names: str = ""    # 自聊会话（自己跟自己）：这些会话里靠"我说过什么"来分辨谁在说,     # 抖音昵称=QQ号，一行一条
     voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
@@ -267,7 +272,9 @@ class Settings:
     rate_comment_per_day: int = 8     # 每天最多发几条评论
     rate_share_per_day: int = 10      # 每天最多分享几次
     rate_like_per_day: int = 30       # 每天最多点几个赞
-    rate_dm_per_hour: int = 6         # 每小时最多回几条私信（留给 0.9.x）
+    rate_dm_per_hour: int = 6         # 每小时最多回几条私信
+    rate_dm_out_per_hour: int = 3     # 主动发私信：每小时
+    rate_dm_out_per_day: int = 20     # 主动发私信：每天
     rate_summary_per_day: int = 20    # 每天最多写几份私信视频总结
     quiet_hours: str = ""             # 例 "01:00-08:00"，这段时间不发任何东西
     pending_ttl_hours: int = 12       # ask 模式攒下的待执行动作，超过这么久作废
@@ -374,6 +381,10 @@ class Settings:
         dm_chat_no_limit=_as_str(ibx.get("dm_chat_no_limit"), ""),
         dm_chat_poll_s=_as_int(ibx.get("dm_chat_poll_s"), 0, 0, 3600),
         dm_chat_history=_as_int(ibx.get("dm_chat_history"), 6, 0, 20),
+        dm_send_enabled=_as_bool(ibx.get("dm_send_enabled"), True),
+        dm_targets=_as_str(ibx.get("dm_targets"), ""),
+        dm_quota_separate=_as_bool(ibx.get("dm_quota_separate"), True),
+        dm_readback=_as_bool(ibx.get("dm_readback"), True),
         dm_identity=_as_str(ibx.get("dm_identity"), ""),
         dm_self_names=_as_str(ibx.get("dm_self_names"), ""),
         voice_enabled=_as_bool(ac.get("voice_enabled"), True),
@@ -388,6 +399,8 @@ class Settings:
             rate_share_per_day=_as_int(rt.get("rate_share_per_day"), 10, 0, 500),
             rate_like_per_day=_as_int(rt.get("rate_like_per_day"), 30, 0, 999),
             rate_dm_per_hour=_as_int(rt.get("rate_dm_per_hour"), 6, 0, 500),
+            rate_dm_out_per_hour=_as_int(rt.get("rate_dm_out_per_hour"), 3, 0, 200),
+            rate_dm_out_per_day=_as_int(rt.get("rate_dm_out_per_day"), 20, 0, 999),
         rate_summary_per_day=_as_int(rt.get("rate_summary_per_day"), 20, 0, 500),
             quiet_hours=_as_str(rt.get("quiet_hours"), ""),
             pending_ttl_hours=_as_int(rt.get("pending_ttl_hours"), 12, 0, 168),
