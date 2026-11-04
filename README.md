@@ -545,3 +545,49 @@ MIT，见 [LICENSE](LICENSE)。
 - `E:\工作区\_test_dy_memory.py` 14 通过 / 0 失败：只拿这个人的记录、顺序正确、真库能读到 QQ 历史、占位符被滤、身份映射三种写法、免限流名单、`voice.chat` 支持 memory。
 - 自聊去回声实测：`普通会话（全 mine）→ []`、`自聊 echo={插件发过的}→ ['在吗', '那你说说']`。
 - 回归：`_test_dy_inbox` 21/0、`_test_dy_086` 22/0、`_test_dy_voice` 17/0、jobs / cmd / verify 全过。
+
+## 三点九八、窗口看不见、私信收不到、登录老掉：三件事同一个根（v0.9.6）
+
+这三件事是连着报的，查下来根子都在「浏览器到底有没有真的起来」。
+
+### 一、窗口明明配了 false 还是看不见
+
+三层原因，逐层：
+
+| 层 | 现象 | 真实原因 |
+|---|---|---|
+| 1 | 进程列表里根本没有我们的 msedge | `browser.profile_dir` 被填成了 `profiles\小号`（这是 chromium 写的老目录），内核锁里记着 `chromium`，而 `browser.channel` 要 `msedge` → 启动前就被 `channel.lock` 拦住，**一次都没起来** |
+| 2 | 起来了但在屏幕外 | Edge 会从 profile 恢复上次的窗口位置。我们之前把它放在 `-32000`，恢复出来落在左边界外（实测 rect `-1525`） |
+| 3 | 起来了、最小化 | profile 记住的是最小化状态（rect `-25600`），人看不见但进程在 |
+
+修法：`profile_dir` 指向 `profiles\小号\msedge`；`quiet_window=false` 时**显式给 `--window-position=80,60 --window-size=1280,900`**；启动成功后再 `show_window()` 还原一次（防最小化）。实测 rect 从 `-25600` 变成 `(80, 60, 1280, 882)`。
+
+另外加了兜底：`profile_dir` 万一又被人填到基目录，插件自己会认锁、自动落到 `<内核>` 子目录并记一条日志，不再直接拒绝启动。
+
+### 二、抖音私信收不到
+
+同一个根（浏览器没起来 → `私信守护` 每 60 秒抛一次异常，但只写日志，人看不到）。修完启动问题后还有两个坑：
+
+- **页面停在视频页/空白页时找不到「消息」入口**：私信抽屉只挂在首页顶栏。守护每轮先确认 `page.url` 里有 `douyin.com`，不是就先回首页。
+- **守护崩了要出声**：`ProfileKernelMismatch` / `DouyinBlocked` 现在会私聊你一次（10 分钟节流），而不是只写日志。
+
+实测（修完）：`私信守护：本轮读到 3 条私信内容`，并且真的回了话。
+
+### 三、登录态老是掉
+
+不是插件"忘了存"，是**同一个账号被多处同时使用**，抖音按新设备登录把旧会话吊销：
+
+1. 排查时把 `profiles\小号\msedge` 复制成三份、拿同一个 `sessionid` 同时开 → 服务端立刻回 `{"status_code":8,"status_msg":"用户未登录"}`；
+2. 有一段时间**两个 AstrBot 核心同时在跑**（launcher 自己起的一个 + 手工起的一个），两套插件共用一个 profile；
+3. chromium / msedge 混写同一目录（`STATUS_BREAKPOINT` 那次）。
+
+现在的约定：**一个号一份 profile、一个内核、一个核心进程**。`profile_pin=true` 钉住目录不自动迁移，`channel_strict=true` 起不来就报错、绝不偷偷换 chromium。
+
+### 四、一个容易踩的工程坑
+
+插件「重载」不会重新 import 子模块（`douyin.browser` 还是老的代码对象）。所以改完 `douyin/*.py` 后：
+
+- 只发 `/dy reload`：`main.py` 的改动生效，**子模块的改动可能不生效**；
+- 改到 `douyin/browser.py`、`douyin/inbox.py` 这类：**重启 AstrBot 核心**最稳。
+
+症状很好认：日志里的报错文案跟你刚改的代码对不上。
