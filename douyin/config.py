@@ -223,7 +223,7 @@ class Settings:
 
     # 写操作
     auto_like: bool = False
-    auto_comment: bool = False
+    auto_comment: bool = True
 
     # 写操作（分享 / 评论 @）：off=只播报，ask=推送后问一句，auto=自动执行
     action_mode: str = "off"
