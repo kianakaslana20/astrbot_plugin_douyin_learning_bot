@@ -81,6 +81,17 @@ _REPLY_RULES = """有人在你刷到的视频下面 @ 了你，回他一句，�
 """
 
 
+_CHAT_RULES = """你在用抖音私信跟人聊天。回一句，像本人打字。
+
+要求：
+- {max_chars} 字以内，一到两句，可以只回半句
+- 接住对方那句话的意思，别答非所问、别自说自话
+- 不用敬语、不解释自己是谁、不写「有什么可以帮你」
+- 不写 @昵称、不加引号、不用 markdown
+- 对方只是丢个表情/「嗯」这类，就短回，别硬找话题
+"""
+
+
 class Voice:
     """把「说什么」交给模型和人格，把「怎么发出去」留给 social。"""
 
@@ -327,4 +338,40 @@ class Voice:
             if not why:
                 return text[:120]
             logger.info("回评不合格（%s）：%s", why, text[:40])
+        return ""
+
+
+    async def chat(
+        self,
+        *,
+        their: str,
+        history: list[str] | None = None,
+        umo: str = "",
+    ) -> str:
+        """私信里回一句。语气跟着人格走，不套客服腔。"""
+        max_chars = self._max_chars(60)
+        persona = await self.persona_prompt(umo)
+        system = (persona + "\n\n" if persona else "") + _CHAT_RULES.format(
+            max_chars=max_chars
+        )
+        parts = []
+        if history:
+            parts.append("刚才聊的：\n" + "\n".join(history[-6:]))
+        parts.append(f"对方刚说：{their[:200]}")
+        parts.append("回他：")
+        prompt = "\n".join(parts)
+        for attempt in range(2):
+            raw = await self._chat(
+                system if attempt == 0 else system + "\n（上一条太像客服了，用平时说话的方式重说）",
+                prompt,
+                None,
+                umo,
+            )
+            text = self._clean(raw)
+            if not text:
+                break
+            why = self.check(text)
+            if not why:
+                return text[:200]
+            logger.info("聊天回复不合格（%s）：%s", why, text[:40])
         return ""
