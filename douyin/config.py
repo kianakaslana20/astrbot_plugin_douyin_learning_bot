@@ -296,6 +296,9 @@ class Settings:
         un = _section(config, "understand")
         md = _section(config, "media")
         ac = _section(config, "actions")
+        # 0.9.3 起这两组从 actions 里拆出来了；老配置文件（键还在 actions 里）照样能读
+        ibx = {**ac, **_section(config, "inbox")}
+        rt = {**ac, **_section(config, "rate")}
 
         def top(key: str, default: Any = None) -> Any:
             try:
@@ -350,19 +353,19 @@ class Settings:
             mention_targets=_as_list(ac.get("mention_targets")),
             comment_template=_as_str(ac.get("comment_template"), ""),
             action_delay_s=_as_int(ac.get("action_delay_s"), 6, 2, 120),
-            action_jitter=_as_bool(ac.get("action_jitter"), True),
+            action_jitter=_as_bool(rt.get("action_jitter"), True),
             max_actions_per_round=_as_int(ac.get("max_actions_per_round"), 2, 0, 20),
             action_dump=_as_bool(ac.get("action_dump"), True),
-            inbox_dm=_as_bool(ac.get("inbox_dm"), True),
-        inbox_mentions=_as_bool(ac.get("inbox_mentions"), True),
-        inbox_max_conversations=_as_int(ac.get("inbox_max_conversations"), 8, 1, 30),
-        inbox_max_cards=_as_int(ac.get("inbox_max_cards"), 3, 1, 10),
-        inbox_share_summary=_as_bool(ac.get("inbox_share_summary"), True),
-        inbox_mention_reply=_as_bool(ac.get("inbox_mention_reply"), True),
-        dm_allow=_as_str(ac.get("dm_allow"), ""),
-        dm_chat_enabled=_as_bool(ac.get("dm_chat_enabled"), False),
-        dm_chat_allow=_as_str(ac.get("dm_chat_allow"), ""),
-        dm_chat_max=_as_int(ac.get("dm_chat_max"), 2, 0, 10),
+            inbox_dm=_as_bool(ibx.get("inbox_dm"), True),
+        inbox_mentions=_as_bool(ibx.get("inbox_mentions"), True),
+        inbox_max_conversations=_as_int(ibx.get("inbox_max_conversations"), 8, 1, 30),
+        inbox_max_cards=_as_int(ibx.get("inbox_max_cards"), 3, 1, 10),
+        inbox_share_summary=_as_bool(ibx.get("inbox_share_summary"), True),
+        inbox_mention_reply=_as_bool(ibx.get("inbox_mention_reply"), True),
+        dm_allow=_as_str(ibx.get("dm_allow"), ""),
+        dm_chat_enabled=_as_bool(ibx.get("dm_chat_enabled"), False),
+        dm_chat_allow=_as_str(ibx.get("dm_chat_allow"), ""),
+        dm_chat_max=_as_int(ibx.get("dm_chat_max"), 2, 0, 10),
         voice_enabled=_as_bool(ac.get("voice_enabled"), True),
             voice_persona=_as_str(ac.get("voice_persona"), ""),
             voice_max_chars=_as_int(ac.get("voice_max_chars"), 40, 6, 200),
@@ -370,15 +373,15 @@ class Settings:
             voice_timeout_s=_as_int(ac.get("voice_timeout_s"), 60, 5, 300),
             voice_banned=_as_str(ac.get("voice_banned"), ""),
             enforce_allowlist=_as_bool(ac.get("enforce_allowlist"), True),
-            rate_enabled=_as_bool(ac.get("rate_enabled"), True),
-            rate_comment_per_day=_as_int(ac.get("rate_comment_per_day"), 8, 0, 500),
-            rate_share_per_day=_as_int(ac.get("rate_share_per_day"), 10, 0, 500),
-            rate_like_per_day=_as_int(ac.get("rate_like_per_day"), 30, 0, 999),
-            rate_dm_per_hour=_as_int(ac.get("rate_dm_per_hour"), 6, 0, 500),
-        rate_summary_per_day=_as_int(ac.get("rate_summary_per_day"), 20, 0, 500),
-            quiet_hours=_as_str(ac.get("quiet_hours"), ""),
-            pending_ttl_hours=_as_int(ac.get("pending_ttl_hours"), 12, 0, 168),
-            keep_days=_as_int(ac.get("keep_days"), 30, 0, 3650),
+            rate_enabled=_as_bool(rt.get("rate_enabled"), True),
+            rate_comment_per_day=_as_int(rt.get("rate_comment_per_day"), 8, 0, 500),
+            rate_share_per_day=_as_int(rt.get("rate_share_per_day"), 10, 0, 500),
+            rate_like_per_day=_as_int(rt.get("rate_like_per_day"), 30, 0, 999),
+            rate_dm_per_hour=_as_int(rt.get("rate_dm_per_hour"), 6, 0, 500),
+        rate_summary_per_day=_as_int(rt.get("rate_summary_per_day"), 20, 0, 500),
+            quiet_hours=_as_str(rt.get("quiet_hours"), ""),
+            pending_ttl_hours=_as_int(rt.get("pending_ttl_hours"), 12, 0, 168),
+            keep_days=_as_int(rt.get("keep_days"), 30, 0, 3650),
         )
 
         bg = _section(config, "notify") or _section(config, "background")
