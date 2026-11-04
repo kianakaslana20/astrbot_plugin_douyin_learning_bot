@@ -10,6 +10,9 @@ wss 长连接，纯 HTTP 拼不出来。而界面上这些东西都摆着：会�
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -77,6 +80,7 @@ class ImWatcher:
         self._cdp_urls = {}
         self._closed = False
         self.dropped = 0
+        self.dump_dir = None
         page.on("websocket", self._on_ws)
 
     async def start(self):
@@ -86,6 +90,7 @@ class ImWatcher:
             self._cdp = await self.page.context.new_cdp_session(self.page)
             self._cdp.on("Network.webSocketCreated", self._cdp_created)
             self._cdp.on("Network.webSocketFrameReceived", self._cdp_frame)
+            self._cdp.on("Network.webSocketFrameSent", self._cdp_sent)
             self._cdp.on("Network.webSocketClosed", self._cdp_closed)
             await self._cdp.send("Network.enable")
         except Exception as exc:
@@ -126,6 +131,20 @@ class ImWatcher:
         self._sockets.add(key)
         self._on_frame(payload, route)
 
+    def _cdp_sent(self, event):
+        key = event.get("requestId", "")
+        route = self._cdp_urls.get(key, "unknown")
+        if not route:
+            return
+        response = event.get("response") or {}
+        payload = response.get("payloadData", "")
+        if response.get("opcode") == 2:
+            try:
+                payload = base64.b64decode(payload, validate=True)
+            except Exception:
+                return
+        self._on_sent_frame(payload, route)
+
     def _cdp_closed(self, event):
         self._closed_socket(event.get("requestId", ""))
 
@@ -145,6 +164,38 @@ class ImWatcher:
         name = {"im": "私信通道(frontier-im)", "notice": "平台互动(frontier-pc)"}.get(route, route)
         logger.info("事件守护：接上 %s 的 WebSocket，后面按帧解码", name)
 
+    def _dump(self, payload, route: str, direction: str) -> None:
+        """把原始帧落盘（`action_dump` 打开时才有目录）。
+
+        不写日志、不解释内容 —— 只留字节，事后离线跑 decode_frame 就能知道
+        schema 对没对，不用再猜。
+        """
+        root = getattr(self, "dump_dir", None)
+        if not root:
+            return
+        try:
+            if isinstance(payload, str):
+                raw = payload.encode("utf-8", "replace")
+            else:
+                raw = bytes(payload)
+            if len(raw) < 40:
+                return
+            path = os.path.join(root, "frames.jsonl")
+            if os.path.exists(path) and os.path.getsize(path) > 4 * 1024 * 1024:
+                return
+            os.makedirs(root, exist_ok=True)
+            rec = {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "route": route,
+                "dir": direction,
+                "n": len(raw),
+                "b64": base64.b64encode(raw).decode(),
+            }
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def _on_ws(self, ws):
         route = self._route(getattr(ws, "url", "") or "")
         if not route:
@@ -156,13 +207,25 @@ class ImWatcher:
         self._sockets.add(key)
         self._log_once(route)
         ws.on("framereceived", lambda payload: self._on_frame(payload, route))
+        ws.on("framesent", lambda payload: self._on_sent_frame(payload, route))
         ws.on("close", lambda *args: self._closed_socket(key))
         ws.on("socketerror", lambda *args: self._closed_socket(key))
+
+    def _on_sent_frame(self, payload, route="unknown"):
+        """我们发出去的帧：只落盘做证据，不当通知信号。
+
+        自己发一条私信时，客户端会把 MessageBody 按同样的 protobuf 结构推上去 ——
+        这正好是「用真实字节验 schema」最省事的来源。
+        """
+        if self._closed:
+            return
+        self._dump(payload, route, "out")
 
     def _on_frame(self, payload, route="unknown"):
         if self._closed:
             return
         self.frames += 1
+        self._dump(payload, route, "in")
         if route != "unknown":
             self.last_rx = time.monotonic()
             self.disconnected_at = 0.0
