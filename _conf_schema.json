@@ -549,6 +549,40 @@
         "description": "自聊会话（自己跟自己）的昵称",
         "default": "",
         "hint": "抖音里私聊自己那个会话，两边都显示成自己发的。填上昵称（如 大肥鱼Yume）后，插件会把「不是它自己发过的」那些当作你在说，就能一对一句地聊。"
+      },
+      "agent_enabled": {
+        "type": "bool",
+        "description": "事件交给模型判断",
+        "default": true,
+        "hint": "开：私信/评论/@ 到手后先问模型「该不该回、回什么」；关：按原来的规则直出。"
+      },
+      "event_ws": {
+        "type": "bool",
+        "description": "用 IM 的 WebSocket 帧当触发信号",
+        "default": true,
+        "hint": "抖音私信走 wss://frontier-im；这里只把「非心跳帧」当有动静的信号，不在本地解 protobuf。"
+      },
+      "poll_fallback_min": {
+        "type": "int",
+        "description": "兜底轮询间隔（分钟）",
+        "default": 10,
+        "hint": "WebSocket 静默超过 5 分钟才用；日志里会标 来源=poll。"
+      },
+      "autonomous_round": {
+        "type": "bool",
+        "description": "自主刷（不用 /dy start）",
+        "default": true,
+        "hint": "满足「距上次刷完超过 loop_interval_min／有人分享或评论／你最近 30 分钟有互动」任一条就自己刷一轮，刷前先问模型值不值得。"
+      },
+      "auto_rounds_per_day": {
+        "type": "int",
+        "description": "自主刷每天最多几轮",
+        "default": 4
+      },
+      "auto_items_per_day": {
+        "type": "int",
+        "description": "自主刷每天最多看几条",
+        "default": 8
       }
     }
   },
