@@ -137,11 +137,15 @@ class Inbox:
                     )
                 )
             if chat_on and _allowed(conv.name, chat_allow):
+                self_chat = any(
+                    a == conv.name or a in conv.name or conv.name in a for a in self._self_names()
+                )
                 echo = set()
-                if any(a == conv.name or a in conv.name or conv.name in a for a in self._self_names()):
-                    if callable(self.sent_lookup):
-                        echo = self.sent_lookup(conv.name, 30) or set()
-                for m in _incoming_texts(msgs, limit=max_cards, echo=echo):
+                if self_chat and callable(self.sent_lookup):
+                    echo = self.sent_lookup(conv.name, 30) or set()
+                for m in _incoming_texts(
+                    msgs, limit=max_cards, echo=echo, self_chat=self_chat
+                ):
                     out.append(
                         Entry(
                             kind="dm_text",
@@ -218,11 +222,14 @@ def _allowed(name: str, allow: list[str]) -> bool:
     return any(a == name or a in name or name in a for a in allow)
 
 
-def _incoming_texts(msgs: list, limit: int = 3, echo: set | None = None) -> list:
+def _incoming_texts(
+    msgs: list, limit: int = 3, echo: set | None = None, self_chat: bool = False
+) -> list:
     """只取别人发来的、有内容的纯文本，最后 limit 条。
 
-    echo：自聊会话（自己跟自己）专用 —— 那种会话里两边都标成"我发的"，
-    所以"不是我发过的那几句"才是对方刚打的。
+    self_chat：自己跟自己的会话。那种会话两边都标成"我发的"，只能反过来认：
+      不在 echo（我自己发过的话）里的，就是对方刚打的。
+      注意 echo 可能是空集（插件还没说过话），这时**不能**当成"全是我发的"。
     """
     echo = echo or set()
     out = []
@@ -232,8 +239,9 @@ def _incoming_texts(msgs: list, limit: int = 3, echo: set | None = None) -> list
         text = (m.text or "").strip()
         if not text:
             continue
-        if m.mine and not (echo and text not in echo):
-            continue
+        if m.mine:
+            if not self_chat or text in echo:
+                continue
         out.append(m)
     return out[-limit:]
 
