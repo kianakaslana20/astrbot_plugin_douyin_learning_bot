@@ -496,6 +496,30 @@
         "default": 2,
         "hint": "一轮扫描里同一个人最多读到几条消息、最多回几次。"
       },
+      "dm_send_enabled": {
+        "type": "bool",
+        "description": "允许主动发私信",
+        "default": true,
+        "hint": "关掉之后 /dy dm 一律拒绝；ask 模式仍要先 /dy confirm"
+      },
+      "dm_targets": {
+        "type": "string",
+        "description": "私信发送白名单",
+        "default": "",
+        "hint": "只允许发给这些昵称（逗号分隔）。空 = 谁都不发。发送前还会核对昵称是否一致"
+      },
+      "dm_quota_separate": {
+        "type": "bool",
+        "description": "主动私信单独算配额",
+        "default": true,
+        "hint": "开：和「回私信」的每小时额度分开算；关：共用同一个池"
+      },
+      "dm_readback": {
+        "type": "bool",
+        "description": "发完回读校验",
+        "default": true,
+        "hint": "发出去后读最后一条气泡确认真到了；关掉就只看界面动作成不成"
+      },
       "dm_chat_no_limit": {
         "type": "text",
         "description": "不限次数的私聊对象（昵称，逗号分隔）",
@@ -562,6 +586,18 @@
         "default": 6,
         "description": "私信：每小时最多回几条",
         "hint": "私信回复的节奏是 0.9.x 的功能用的；先在这里定好上限。"
+      },
+      "rate_dm_out_per_hour": {
+        "type": "int",
+        "description": "主动私信：每小时上限",
+        "default": 3,
+        "hint": "0 = 不发"
+      },
+      "rate_dm_out_per_day": {
+        "type": "int",
+        "description": "主动私信：每天上限",
+        "default": 20,
+        "hint": "0 = 不发"
       },
       "rate_summary_per_day": {
         "type": "int",
