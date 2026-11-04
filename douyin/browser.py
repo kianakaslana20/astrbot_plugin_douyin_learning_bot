@@ -331,7 +331,11 @@ class DouyinBrowser:
     async def _page(self):
         ctx = await self._ensure()
         pages = [p for p in ctx.pages if not p.is_closed()]
-        return pages[0] if pages else await ctx.new_page()
+        page = pages[0] if pages else await ctx.new_page()
+        hook = getattr(self, "on_page_ready", None)
+        if hook is not None:
+            await hook(page)
+        return page
 
     async def page(self):
         """对外暴露的页面句柄：写操作（分享/评论）复用同一个登录态。"""
