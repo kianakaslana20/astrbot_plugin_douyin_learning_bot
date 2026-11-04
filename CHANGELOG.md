@@ -297,3 +297,13 @@
 - 复用 0.8.6 的闸门：`inbox` 表幂等、频率限制、静默时段、`pending_ttl_hours`、`keep_days`。
 - 私信白名单 `dm_allow` 与分享/@ 白名单分开：分享错人只是尴尬，私信发错人是骚扰。
 
+
+## 0.9.6
+
+### 修：窗口看不见 / 私信收不到 / 登录老掉（同一个根）
+
+- `browser.profile_dir` 指到 chromium 基目录、`channel` 要 msedge → 内核锁拦启动，浏览器一次都没起来。
+  - 新增 `_resolve_profile()`：`profile_dir` 填到基目录时自动认锁、落到 `<内核>` 子目录。
+- `quiet_window=false` 时显式 `--window-position=80,60 --window-size=1280,900`，不再继承 profile 里的屏外/最小化位置；启动后补一次 `show_window()`。
+- 私信守护每轮先把页面带回首页（私信抽屉只在首页顶栏）；`ProfileKernelMismatch`/`DouyinBlocked` 会私聊主人一次（10 分钟节流）；每轮记录「读到 N 条 / 新 M 条」。
+- 文档：三件事的因果链、登录被顶号的三个来源、重载不重导子模块的坑。
