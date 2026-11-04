@@ -73,6 +73,34 @@ CONV_JS = """() => {
   return out;
 }"""
 
+PLACEHOLDERS = {"打个招呼吧", "发一条消息", "发送消息", "说点什么…", "说点什么..."}
+
+ROW_CLICK_JS = """
+(name) => {
+  const rows = [...document.querySelectorAll('[data-e2e="conversation-item"]')];
+  const hit = rows.find(r => (r.innerText || '').split('\\n')[0].trim() === name)
+           || rows.find(r => (r.innerText || '').includes(name));
+  if (!hit) return 'no-row:' + rows.length;
+  const fire = (t) => hit.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window}));
+  fire('pointerover'); fire('mouseover'); fire('mousedown'); fire('mouseup'); fire('click');
+  return 'ok';
+}
+"""
+
+CHAT_NAME_JS = """
+() => {
+  const p = document.querySelector('[data-e2e="im-dialog"]');
+  if (!p) return '';
+  for (const sel of ['[class*="ChatHeadertitleContainer"]',
+                     '[class*="ChatHeaderinfoContainer"]']) {
+    const e = p.querySelector(sel);
+    const t = e && (e.innerText || '').trim();
+    if (t) return t.split('\\n')[0].trim();
+  }
+  return '';
+}
+"""
+
 MSG_JS = """() => {
   const rows = [...document.querySelectorAll('[data-e2e="msg-item-content"]')];
   const dlg = document.querySelector('[data-e2e="im-dialog"]');
@@ -95,7 +123,8 @@ MSG_JS = """() => {
       x: card ? Math.round((card.getBoundingClientRect().x + card.getBoundingClientRect().width / 2)) : 0,
       y: card ? Math.round((card.getBoundingClientRect().y + card.getBoundingClientRect().height / 2)) : 0,
       cx: Math.round(r.x + r.width / 2),
-      mine: (r.x + r.width / 2) > mid,
+      // 气泡根节点上有 isFromMe 标记（MessageBoxContentisFromMe），比位置可靠
+      mine: !!(el.closest('[class*="isFromMe"]') || (r.x + r.width / 2) > mid),
     });
   }
   return out;
@@ -171,33 +200,50 @@ class DirectMessages:
         if not await self.open_panel(page):
             return []
         rows = await page.evaluate(CONV_JS) or []
+        # 昵称有时比列表晚一步渲染，抓到的会是纯数字 uid。等它长出来再读。
+        for _ in range(4):
+            if rows and not any(_looks_uid(r.get("name", "")) for r in rows):
+                break
+            await page.wait_for_timeout(600)
+            rows = await page.evaluate(CONV_JS) or rows
         if not rows:
-            # 面板可能停在上一次的聊天视图（没有会话列表）。回首页重开一次，别在这儿猜。
-            await page.goto("https://www.douyin.com/", wait_until="domcontentloaded")
-            for _ in range(12):
-                await page.wait_for_timeout(700)
-                if await page.evaluate("() => !!document.querySelector('[data-e2e=\"im-entry\"]')"):
+            # 面板刚打开时列表是异步挂载的，等两轮；还是空就重开一次面板
+            for _ in range(2):
+                await page.wait_for_timeout(900)
+                rows = await page.evaluate(CONV_JS) or []
+                if rows:
                     break
-            if not await self.open_panel(page):
-                return []
-            rows = await page.evaluate(CONV_JS) or []
+            if not rows:
+                await self.open_panel(page)
+                await page.wait_for_timeout(1200)
+                rows = await page.evaluate(CONV_JS) or []
         return [Conversation(**{k: r.get(k, "") for k in ("name", "desc", "when", "x", "y")}) for r in rows]
 
     async def open_conversation(self, page, name: str) -> bool:
-        """按名字（精确→包含）点进某个会话。"""
-        rows = await self.conversations(page)
-        target = next((c for c in rows if c.name == name), None) or next(
-            (c for c in rows if name and (name in c.name or c.name in name)), None
-        )
-        if not target:
-            logger.warning("私信：会话列表里没有「%s」（有 %s）", name, [c.name for c in rows])
-            return False
-        await page.mouse.click(target.x, target.y)
-        for _ in range(8):
-            await page.wait_for_timeout(400)
-            if await page.evaluate("() => document.querySelectorAll('[data-e2e=\"msg-item-content\"]').length > 0"):
-                return True
+        """点进某个会话。
+
+        不用坐标点：聊天视图会盖住列表，坐标点经常点空或点到别的会话。
+        改成在 DOM 里按名字找到列表行、直接派发鼠标事件，再用顶部标题确认进对了人。
+        """
+        for attempt in range(2):
+            hit = await page.evaluate(ROW_CLICK_JS, name)
+            for _ in range(8):
+                await page.wait_for_timeout(400)
+                who = await self.chat_name(page)
+                if who and (who == name or name in who or who in name):
+                    return True
+            logger.info("私信：点「%s」没进对会话（第 %d 次，返回 %s，头部「%s」）",
+                        name, attempt + 1, hit, await self.chat_name(page))
+            # 列表可能还没渲染，等一会儿再试
+            await self.conversations(page)
         return False
+
+    async def chat_name(self, page) -> str:
+        """当前聊天视图顶部显示的名字（空串=没在聊天里）。"""
+        try:
+            return (await page.evaluate(CHAT_NAME_JS)) or ""
+        except Exception:  # noqa: BLE001
+            return ""
 
     # ------------------------------------------------------------------ 消息
 
@@ -222,7 +268,7 @@ class DirectMessages:
                 if not msg.aweme_id and found:
                     msg.aweme_id = found.group(1)
                 out.append(msg)
-            elif text:
+            elif text and text not in PLACEHOLDERS:
                 out.append(Message(kind="text", text=text, mine=r.get("mine", False)))
         return out
 
@@ -309,3 +355,8 @@ __all__ = [
     "aweme_id_of",
     "extract_urls",
 ]
+
+
+def _looks_uid(name: str) -> bool:
+    n = (name or "").strip()
+    return n.isdigit() and len(n) >= 6
