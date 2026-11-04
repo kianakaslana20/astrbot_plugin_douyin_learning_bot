@@ -1701,3 +1701,29 @@ yezheyue 朋友 模型里面有敏感限制吗[看]我想给我家鱼安排上@�
 - rect `(80, 60, 1280, 882)`、`vis=True`、`iconic=False`；
 - `私信守护：本轮读到 3 条私信内容，新 0 条`（0 新是因为已处理过）；
 - `私信守护：回了：「…」` 两条（修复前就已回成功，说明登录与写入都正常）。
+
+## 30. 主动发私信（v0.9.7）
+
+### 30.1 为什么不走接口
+私信在 imsdk 里：`appKey e1bd35ec9db7b8d846de66ed140b1ad9`、`frontierUrl
+wss://frontier-im.douyin.com/ws/v2`、发送走 `/v1/message/send` 且要 SDK token。
+纯 HTTP 复现成本高、风控还严。走界面则一切都由页面自己算。
+
+### 30.2 界面路径
+顶栏 `[data-e2e="im-entry"]`（im SDK 起来才挂上，实测 11~15 秒）→ 抽屉
+`[data-e2e="im-dialog"]`（336×932）→ 会话行 `[data-e2e="conversation-item"]`
+→ 点行进会话（用 `ROW_CLICK_JS` 派发事件，坐标点在聊天视图里会点空）
+→ 头部标题 `ChatHeadertitleContainer` 核对是不是进对人了
+→ 输入区 `div.editor-kit-container`（`msg-input` 只是外壳）→ 打字 → Enter。
+
+### 30.3 回读
+`sent_ok()`：输入框已清空 **且** 抽屉 innerText 里出现这句话。
+不能用「最后一条消息节点」——分享卡会排在最后，读到的是卡片作者名（实测踩过）。
+
+### 30.4 幂等与配额
+`dm_outbox` 与 `inbox` 分表；配额 `rate_dm_out_*` 独立，可用 `dm_quota_separate`
+并回 `dm` 池。发送前四道关：白名单 → 开关 → action_mode → 配额。
+
+### 30.5 验证
+真机 `send_dm → True | 已发给「大肥鱼Yume」并回读确认`；
+单测 `_test_dy_dm_send.py` 23/0；`_test_dy_inbox.py` 23/0。
