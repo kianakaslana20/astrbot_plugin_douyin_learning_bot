@@ -267,7 +267,8 @@ class DecoderTests(unittest.TestCase):
         self.unknown(frame(extra=integer(1, 55)), "wire_duplicate_singular")
         self.unknown(frame(extra=blob(7, "pb")), "wire_duplicate_singular")
         self.unknown(frame(), "wire_field_limit", limits=Limits(max_fields=4))
-        self.unknown(integer(1, 1), "unknown_frame_schema")
+        self.unknown(integer(90, 5), "unknown_frame_schema")
+        self.unknown(integer(1, 1))  # 只有 seqid、没有 payload 类型：仍然不算可用帧
 
     def test_unknown_fields_are_skipped_not_guessed(self):
         extra = integer(100, 8) + blob(101, b"arbitrary not a protobuf")
@@ -349,6 +350,41 @@ class DecoderTests(unittest.TestCase):
         self.assertEqual(len(wsproto.SCHEMA_COMMIT), 40)
         for source in wsproto.SCHEMA_SOURCES:
             self.assertIn(wsproto.SCHEMA_COMMIT, source)
+
+
+_REAL = Path(__file__).resolve().parents[1] / "tests" / "_real_frames.txt"
+
+
+@unittest.skipUnless(_REAL.exists(), "抓包 fixture 只在本地存在（含本人 uid，不进仓库）")
+class RealFrameTest(unittest.TestCase):
+    """用真机抓到的 frontier-im 帧跑一遍 —— schema 对不对，看这个。"""
+
+    def setUp(self):
+        import base64
+        self.rows = [base64.b64decode(x.strip())
+                     for x in _REAL.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+    def test_real_control_frame_is_not_a_signal(self):
+        for raw in self.rows:
+            result = decode_frame(raw)
+            self.assertEqual(result.events, [])
+            self.assertFalse(result.dirty, result.diagnostics)
+            self.assertTrue(any(d.startswith("control_message:") for d in result.diagnostics),
+                            result.diagnostics)
+
+    def test_real_frame_envelope_decodes(self):
+        import importlib
+        wire = getattr(wsproto, "_wire")
+        budget = wsproto._Budget(wsproto.Limits())
+        frame = wire(self.rows[0], budget)
+        # 真实帧：1=seqid 2=logid 3=service 4=method，5=headers，7='pb'，8=payload
+        self.assertIsNotNone(wsproto._one(frame, 1, 0))
+        self.assertEqual(wsproto._text(wsproto._one(frame, 7, 2)), "pb")
+        payload = wsproto._one(frame, 8, 2)
+        self.assertIsNotNone(payload)
+        body = wire(payload, budget)
+        self.assertEqual(wsproto._one(body, 1, 0), 500)  # cmd
+        self.assertIsNotNone(wsproto._one(body, 6, 2))   # body
 
 
 if __name__ == "__main__":
