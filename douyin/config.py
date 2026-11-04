@@ -233,6 +233,14 @@ class Settings:
     action_delay_s: int = 6
     max_actions_per_round: int = 2
     action_dump: bool = True
+
+    # 文案层：让对话模型 + AstrBot 人格写评论，而不是套模板
+    voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
+    voice_persona: str = ""        # 人格名；留空 = 用该会话的默认人格
+    voice_max_chars: int = 40      # 一条评论多少字以内
+    voice_frames: int = 1          # 给模型看几张图（0=只给文字，1=蒙太奇拼图）
+    voice_timeout_s: int = 60      # 等模型多久
+    voice_banned: str = ""         # 额外禁词，逗号分隔（内置一份 AI 腔词表）
     # 白名单：开了以后只允许对 share_targets / mention_targets 里的人动手，命令里临时写别的名字会被拒
     enforce_allowlist: bool = True
 
@@ -318,6 +326,12 @@ class Settings:
             action_delay_s=_as_int(ac.get("action_delay_s"), 6, 2, 120),
             max_actions_per_round=_as_int(ac.get("max_actions_per_round"), 2, 0, 20),
             action_dump=_as_bool(ac.get("action_dump"), True),
+            voice_enabled=_as_bool(ac.get("voice_enabled"), True),
+            voice_persona=_as_str(ac.get("voice_persona"), ""),
+            voice_max_chars=_as_int(ac.get("voice_max_chars"), 40, 6, 200),
+            voice_frames=_as_int(ac.get("voice_frames"), 1, 0, 4),
+            voice_timeout_s=_as_int(ac.get("voice_timeout_s"), 60, 5, 300),
+            voice_banned=_as_str(ac.get("voice_banned"), ""),
             enforce_allowlist=_as_bool(ac.get("enforce_allowlist"), True),
         )
 
