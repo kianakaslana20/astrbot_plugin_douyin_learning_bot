@@ -38,6 +38,8 @@ try:  # 正常情况：被 AstrBot 当作 data.plugins.<name>.main 加载
     )
     from .douyin.config import Settings, resolve_umo
     from .douyin.feed import parse_aweme
+    from .douyin.agent import DouyinAgent
+    from .douyin.im import ImWatcher
     from .douyin.inbox import Entry, Inbox
     from .douyin.jobs import Job, JobQueue
     from .douyin.limits import Limits
@@ -60,6 +62,8 @@ except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录
     )
     from douyin.config import Settings, resolve_umo  # type: ignore
     from douyin.feed import parse_aweme  # type: ignore
+    from douyin.agent import DouyinAgent
+    from douyin.im import ImWatcher
     from douyin.inbox import Entry, Inbox  # type: ignore
     from douyin.jobs import Job, JobQueue  # type: ignore
     from douyin.limits import Limits  # type: ignore
@@ -201,6 +205,18 @@ class DouyinLearningBot(Star):
         self.social = Social(self.browser, self.settings, dump_dir)
         self.voice = Voice(self.context, self.settings)
         self.inbox = Inbox(self.browser, self.settings)
+        self.agent = DouyinAgent(self.voice, self.settings, self.store, self.memory)
+        self.watcher = None
+        self._watch_attach_lock = asyncio.Lock()
+        self._comment_confirm_lock = asyncio.Lock()
+        self.browser.on_page_ready = self._attach_event_page
+        self._mention_seen: dict[str, str] = {}
+        self._last_round_at = 0.0
+        self._auto_rounds_today = 0
+        self._auto_items_today = 0
+        self._auto_day = ''
+        self._think_task = None
+        self._last_user_at = 0.0
         self.inbox.sent_lookup = self.memory.recent_me
         self._pending: list[tuple] = []
         self._pending_at: float = 0.0
@@ -326,6 +342,7 @@ class DouyinLearningBot(Star):
         self.pipeline.settings = self.settings
         self.social.settings = self.settings
         self.inbox.settings = self.settings
+        self.agent.settings = self.settings
         self.social.dump_dir = (
             (self.data_dir / "social_dumps") if self.settings.action_dump else None
         )
@@ -796,6 +813,7 @@ class DouyinLearningBot(Star):
             await self._retire()
         except Exception as exc:  # noqa: BLE001
             logger.warning("保留期清理失败（不影响这一轮）：%s", exc)
+        self._last_round_at = time.time()
         try:
             await self._migrate_kernel_profile()
             if not await self._ensure_login(job):
@@ -1012,85 +1030,286 @@ class DouyinLearningBot(Star):
         return left < -3000 or top < -3000 or w <= 260 or h <= 120
 
     async def _dm_watch_loop(self) -> None:
-        """私信守护：每隔 dm_chat_poll_s 秒盯一次，只读私信不看提醒。"""
-        gap = int(getattr(self.settings, "dm_chat_poll_s", 0) or 0)
-        if gap <= 0:
+        """私信守护入口（0.10.0 起改为「事件触发 + 兜底轮询」）。"""
+        await self._event_loop()
+
+    async def _attach_event_page(self, page) -> None:
+        """浏览器交出页面的那一刻就把 WS 监听挂上 —— 等到 goto 之后再挂，
+        页面加载期间就已经建好的连接就永远看不到了。"""
+        if not getattr(self.settings, "event_ws", True):
             return
-        logger.info("私信守护已启动，每 %s 秒一次", gap)
+        if not getattr(self.settings, "dm_chat_enabled", False):
+            return
+        lock = getattr(self, "_watch_attach_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._watch_attach_lock = lock
+        async with lock:
+            try:
+                if self.watcher is not None and self.watcher.page is page:
+                    return
+                if self.watcher is not None:
+                    await self.watcher.close()
+                self.watcher = ImWatcher(page)
+                await self.watcher.start()
+                logger.info("事件守护：页面刚建就挂上 WS 监听（导航前）")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("事件守护：提前挂 WS 没成功（%s），等事件循环再试", exc)
+
+    async def _event_loop(self) -> None:
+        """Attach before navigation; business pushes wake the consumer, not a scan timer."""
+        fallback_s = max(600, int(getattr(self.settings, "poll_fallback_min", 10) or 10) * 60)
+        last_poll = time.monotonic()
+        logger.info("事件守护：WS 解码 + 通知补读；仅断线超过 300 秒后每 %s 秒兜底", fallback_s)
         while True:
             try:
-                await asyncio.sleep(gap)
-                if not getattr(self.settings, "dm_chat_enabled", False):
-                    continue
+                await self._ensure_ready()
                 page = await self.browser.page()
-                try:
-                    if "douyin.com" not in (page.url or ""):
-                        await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=45000)
-                        await page.wait_for_timeout(1200)
-                except Exception as exc:  # noqa: BLE001
-                    logger.info("私信守护：回首页没成功（%s），接着试", type(exc).__name__)
-                if self._window_needs_restore():
-                    try:
-                        await self.browser.show_window(page)
-                        logger.info("窗口被最小化或挪出屏幕，已经还原")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.info("窗口还原没成功（%s）", type(exc).__name__)
-                entries = await self.inbox.collect(
-                    page, include_dm=True, include_mentions=False
-                )
-                fresh = []
-                for e in entries or []:
-                    if e.kind != "dm_text":
-                        continue
-                    if await self.store.inbox_add(e.kind, e.key, src=e.src, payload=json.dumps(
-                        {"aweme_id": e.aweme_id, "who": e.who, "text": e.text, "when": e.when},
-                        ensure_ascii=False,
-                    )):
-                        fresh.append(e)
-                replied = 0
-                first = not getattr(self, "_dm_warmed", False)
-                self._dm_warmed = True
-                for e in fresh:
-                    if first:
-                        # 刚启动那一下只记账：历史积压不一次性回一遍
-                        await self.store.inbox_done(e.kind, e.key, "backlog")
-                        continue
-                    try:
-                        line = await self._handle_dm_text(e, self._last_umo or "")
-                        if line.startswith("回了："):
-                            replied += 1
-                        logger.info("私信守护：%s", line)
-                    except HumanVerifyNeeded:
-                        logger.warning("私信守护撞到人机验证，暂停这一轮")
-                    except (ProfileKernelMismatch, DouyinBlocked) as exc:
-                        logger.warning("私信守护起不来：%s", exc)
-                        now = time.time()
-                        if now - getattr(self, "_dm_err_at", 0) > 600:
-                            self._dm_err_at = now
-                            await self._ask_help(
-                                f"抖音那边停了：{exc}\n"
-                                "私信现在收不到，处理完发一句 /dy start 或 /dy show 就行。"
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("私信守护出错：%s", exc)
-                    await self.store.inbox_done(e.kind, e.key, "watcher")
-                logger.info(
-                    "私信守护：本轮读到 %s 条私信内容，新 %s 条，已回 %s 条",
-                    len(entries or []), len(fresh), replied,
-                )
+                if self.watcher is None or self.watcher.page is not page:
+                    if self.watcher is not None:
+                        await self.watcher.close()
+                    self.watcher = ImWatcher(page)
+                    await self.watcher.start()
+                    logger.info("事件守护：已挂 WS/CDATA 监听（导航前）")
+                if "douyin.com" not in (page.url or ""):
+                    await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=45000)
+                if not getattr(self, "_dm_warmed", False):
+                    # Snapshot old DOM only; queued pushes remain available for the next turn.
+                    await self._one_event_round("baseline")
+                if not getattr(self.settings, "event_ws", True):
+                    await asyncio.sleep(fallback_s)
+                    source = "poll"
+                elif await self._wait_signal(self.watcher, 15):
+                    source = "ws"
+                elif self.watcher.fallback_due(last_poll, fallback_s):
+                    source = "poll"
+                else:
+                    continue
+                if source == "poll":
+                    last_poll = time.monotonic()
+                await self._one_event_round(source)
             except asyncio.CancelledError:
-                logger.info("私信守护已停止")
+                return
+            except Exception as exc:
+                logger.warning("事件守护异常：%s", exc)
+                await asyncio.sleep(15)
+
+    async def _wait_signal(self, watcher, timeout_s: int) -> bool:
+        try:
+            await asyncio.wait_for(watcher.wake.wait(), timeout=timeout_s)
+            await asyncio.sleep(0.35)  # coalesce a burst, no polling of the UI
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _one_event_round(self, source: str) -> None:
+        page = await self.browser.page()
+        watcher = getattr(self, "watcher", None)
+        raw, routes = watcher.drain() if watcher and source == "ws" else ([], set())
+        include_dm = source != "ws" or bool(routes & {"im", "unknown"})
+        include_mentions = source != "ws" or bool(routes & {"notice", "unknown"})
+        try:
+            entries = await self.inbox.collect(page, include_dm=include_dm, include_mentions=include_mentions)
+        except Exception:
+            # 界面读失败不能把已经解析出来的推送一起丢掉：放回队列，下一轮再读。
+            if watcher and raw:
+                watcher.restore(raw)
+                for evt in raw:
+                    watcher.release(evt)
+            raise
+        entries = list(entries or [])
+        # Enrich a decoded IM event only with an exact UID cache or matching DOM item.
+        # No guessing nicknames from a protobuf number; group cards never become public replies.
+        for evt in raw:
+            extra = evt.get("extra") or {}
+            if extra.get("channel") == "im" and extra.get("conversation_type") not in (None, 1, "1"):
+                continue
+            uid = str(evt.get("from_uid") or "")
+            who = str(evt.get("from_nick") or "")
+            if not who and uid:
+                names = [name for name, slot in getattr(self.social, "_uid_cache", {}).items()
+                         if isinstance(slot, dict) and str(slot.get("uid") or "") == uid]
+                if len(names) == 1:
+                    who = names[0]
+            evt["from_nick"] = who
+            # Use DOM key where possible, so a later fallback does not replay the same event.
+            candidates = [e for e in entries if e.kind in {"dm_text", "dm_share"}
+                          and who and e.who == who
+                          and ((evt.get("aweme_id") and e.aweme_id == evt["aweme_id"])
+                               or (evt.get("content") and e.text == evt["content"]))]
+            if len(candidates) == 1:
+                candidates[0].extra.update({"event_id": evt.get("event_id"),
+                    "raw_frame_id": evt.get("raw_frame_id"), "from_uid": uid,
+                    "timestamp": evt.get("timestamp"), "protocol": True})
+                continue
+            # Preserve structured evidence even when DOM/identity is not ready.
+            await self.store.inbox_add("ws_evidence", str(evt.get("event_id") or evt.get("raw_frame_id")),
+                src="ws", payload=json.dumps(evt, ensure_ascii=False))
+            await self.store.inbox_done("ws_evidence", str(evt.get("event_id") or evt.get("raw_frame_id")), "decoded_wait_identity")
+            # Exact nickname alone does not establish that this is an incoming message.
+            # Unmatched IM events remain evidence until the UI confirms sender direction.
+        fresh = []
+        queued_users = set()
+        skipped = replied = judged = 0
+        why = []
+        peek = getattr(watcher, "peek", None) if (watcher and source == "baseline") else None
+        pending_push = list(peek() or []) if callable(peek) else []
+        try:
+            for e in entries:
+                if e.kind not in {"dm_text", "dm_share", "mention", "comment"}:
+                    continue
+                if pending_push and self._matches_push(e, pending_push):
+                    # 首次快照时队列里已经有这条推送 → 留到 WS 那一轮按新消息处理，
+                    # 否则「backlog」会把它一起埋掉，看着像没收到。
+                    skipped += 1
+                    why.append("刚推过来的，留给 WS 那轮")
+                    continue
+                added = await self.store.inbox_add(e.kind, e.key, src=e.src,
+                    payload=json.dumps({"aweme_id": e.aweme_id, "who": e.who, "text": e.text,
+                                        "when": e.when, "extra": e.extra}, ensure_ascii=False))
+                if not added:
+                    continue
+                if source == "baseline":
+                    await self.store.inbox_done(e.kind, e.key, "backlog")
+                    skipped += 1
+                    continue
+                uid = str(e.extra.get("from_uid") or e.who or e.key)
+                if e.kind in {"mention", "comment"}:
+                    if uid in queued_users:
+                        await self.store.inbox_done(e.kind, e.key, "same_user_pending")
+                        skipped += 1
+                        why.append("同用户已有待回复评论")
+                        continue
+                    queued_users.add(uid)
+                fresh.append(e)
+            self._dm_warmed = True
+            self._event_judged_reply = 0
+            for e in fresh:
+                try:
+                    self._last_user_at = time.time()
+                    if e.kind in {"mention", "comment"}:
+                        line = await self._handle_mention(page, e, self._last_umo or "")
+                    elif e.kind == "dm_share":
+                        line = await self._handle_dm_share_event(e, self._last_umo or "")
+                    else:
+                        line = await self._handle_dm_text(e, self._last_umo or "")
+                    if line.startswith("回了："):
+                        replied += 1
+                    else:
+                        skipped += 1
+                        why.append(line[:100])
+                    await self.store.inbox_done(e.kind, e.key, line[:300])
+                except Exception as exc:
+                    skipped += 1
+                    why.append(type(exc).__name__)
+                    await self.store.inbox_done(e.kind, e.key, "error:" + type(exc).__name__)
+                    logger.warning("事件处理失败(%s): %s", source, exc)
+            logger.info("事件守护(%s)：解码 %s 条，读到 %s 条，新 %s 条，模型判断 reply %s 条，发出 %s 条，跳过 %s 条；%s",
+                        source, len(raw), len(entries), len(fresh), getattr(self, "_event_judged_reply", 0),
+                        replied, skipped, "；".join(why[:5]) or "无")
+        finally:
+            for evt in raw:
+                watcher.release(evt)
+
+    def _matches_push(self, entry: Entry, events: list) -> bool:
+        """DOM 读到的这一条，是不是 WS 队列里刚推过来的同一条。"""
+        text = (entry.text or "").strip()
+        for evt in events or []:
+            content = str(evt.get("content") or "").strip()
+            if content and text and content == text:
+                return True
+            if evt.get("aweme_id") and str(evt["aweme_id"]) == entry.aweme_id:
+                return True
+        return False
+
+    async def _handle_dm_share_event(self, entry: Entry, umo: str) -> str:
+        """有人分享来一条视频：值得看就学，再写一句人味总结。"""
+        if not getattr(self.settings, "inbox_share_summary", True):
+            return "分享总结没开，只记账"
+        item = await self.inbox.fetch_item(await self.browser.page(), entry.aweme_id)
+        if item is None:
+            return f"这条视频读不到（{entry.aweme_id}）"
+        analysis = await self.pipeline._handle_one(item, 0.0, umo or "")
+        if analysis is None:
+            return "这条没看懂，先不写"
+        text = await self.voice.summary(
+            title=item.title, author=item.author,
+            analysis_summary=getattr(analysis, "summary", ""),
+            keywords=", ".join(getattr(analysis, "keywords", []) or []),
+            transcript=getattr(analysis, "transcript", ""),
+            frames=[getattr(analysis, "montage", "")] if getattr(self.settings, "voice_frames", 1) else [],
+            umo=umo,
+        )
+        if not text:
+            return "模型没写出像人话的总结，先不发"
+        await self._notify_text(umo, f"{entry.who} 分享来一条：{item.title}\n\n{text}", umo=umo)
+        return "回了：分享总结已发"
+
+    # ---------------------------------------------------------------- 自主刷
+    async def _auto_think_loop(self) -> None:
+        """自主触发器：不靠用户指令也能自己决定刷一轮。"""
+        if not getattr(self.settings, "autonomous_round", True):
+            return
+        logger.info("自主刷：已启动（每 5 分钟看一次条件）")
+        while True:
+            try:
+                await asyncio.sleep(300)
+                await self._maybe_autonomous_round()
+            except asyncio.CancelledError:
+                logger.info("自主刷已停止")
                 return
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                        "私信守护循环异常：%s（目录=%s 锁=%s 内核=%s）",
-                        exc,
-                        getattr(self.browser, "profile_dir", "?"),
-                        (self.browser.channel_lock.read_text("utf-8").strip()
-                         if getattr(self.browser, "channel_lock", None)
-                         and self.browser.channel_lock.exists() else "无"),
-                        getattr(self.settings, "channel", "?"),
-                    )
+                logger.warning("自主刷异常：%s", exc)
+
+    def _auto_budget_ok(self) -> tuple[bool, str]:
+        day = time.strftime("%Y-%m-%d")
+        if day != getattr(self, "_auto_day", ""):
+            self._auto_day = day
+            self._auto_rounds_today = 0
+            self._auto_items_today = 0
+        cap_r = int(getattr(self.settings, "auto_rounds_per_day", 4) or 0)
+        cap_i = int(getattr(self.settings, "auto_items_per_day", 8) or 0)
+        if cap_r and self._auto_rounds_today >= cap_r:
+            return False, f"今天自主刷已经 {self._auto_rounds_today} 轮（上限 {cap_r}）"
+        if cap_i and self._auto_items_today >= cap_i:
+            return False, f"今天自主刷已经看了 {self._auto_items_today} 条（上限 {cap_i}）"
+        return True, ""
+
+    async def _maybe_autonomous_round(self) -> None:
+        ok, why = self._auto_budget_ok()
+        if not ok:
+            return
+        now = time.time()
+        interval_min = int(getattr(self.settings, "loop_interval_min", 90) or 90)
+        since = int((now - (self._last_round_at or 0)) / 60) if self._last_round_at else 9999
+        pending = await self.store.inbox_pending(limit=5) if hasattr(self.store, "inbox_pending") else []
+        human_recent = (now - (self._last_user_at or 0)) < 1800 if getattr(self, "_last_user_at", 0) else False
+        due_by_time = since >= interval_min
+        if not (due_by_time or human_recent or pending):
+            return
+        info = {
+            "since_last_min": since, "last_count": self._auto_items_today,
+            "today_rounds": self._auto_rounds_today,
+            "max_rounds": int(getattr(self.settings, "auto_rounds_per_day", 4) or 0),
+            "human_recent": human_recent,
+            "pending": ", ".join(str(p.get("kind")) for p in (pending or [])[:3]),
+            "why": f"时间到了={due_by_time} 人在={human_recent} 有待处理={bool(pending)}",
+        }
+        decision = await self.agent.judge_round(info, self._last_umo or "")
+        take = int(decision.get("take") or 0)
+        if not decision.get("run") or take <= 0:
+            logger.info("自主刷：模型判断这轮不用刷（%s）", decision.get("reason") or "没给理由")
+            return
+        job = self.jobs.submit("round", self._last_umo or "", take)
+        if job is None:
+            logger.info("自主刷：队列满了，这轮放弃")
+            return
+        self._auto_rounds_today += 1
+        self._auto_items_today += take
+        self._last_round_at = now
+        logger.info("自主刷：模型说值得刷 %s 条（%s）", take, decision.get("reason") or "")
+        if getattr(self.settings, "notify_start", False):
+            await self._ask_help(f"自主判断触发：我刷一轮（{take} 条）。理由：{decision.get('reason') or '时间到了'}")
 
     async def _handle_dm_text(self, entry: Entry, umo: str) -> str:
         """别人发来一句话：按人格回一句，发回去。"""
@@ -1098,7 +1317,7 @@ class DouyinLearningBot(Star):
             return "日常聊天没开（配置里 dm_chat_enabled），只记账不回"
         allow = [x.strip() for x in (self.settings.dm_chat_allow or "").replace("，", ",").split(",") if x.strip()]
         who = entry.who or ""
-        if not allow or not any(a == who or a in who or who in a for a in allow):
+        if not allow or not any(a == who or a == str(entry.extra.get("from_uid") or "") for a in allow):
             return f"「{who}」不在日常聊天白名单里，不回"
         free = [
             x.strip()
@@ -1107,11 +1326,55 @@ class DouyinLearningBot(Star):
             .split(",")
             if x.strip()
         ]
-        unlimited = any(a == who or a in who or who in a for a in free)
-        if not unlimited:
+        # 0.10.0：自己人（dm_targets）也算免限流；但静默时段仍然生效
+        free += [
+            x.strip()
+            for x in (getattr(self.settings, "dm_targets", "") or "")
+            .replace("，", ",")
+            .replace("、", ",")
+            .split(",")
+            if x.strip()
+        ]
+        unlimited = any(a == who or a == str(entry.extra.get("from_uid") or "") for a in free)
+        if unlimited:
+            if self.limits.in_quiet_hours(getattr(self.settings, "quiet_hours", "")):
+                return "静默时段，先不回"
+        else:
             why = await self.limits.check_async("dm", self.settings)
             if why:
                 return f"先不回：{why}"
+        # 0.10.0：先问模型「该不该回、回什么」
+        text0 = ""
+        if getattr(self.settings, "agent_enabled", True):
+            decision = await self.agent.handle_douyin_event(
+                {
+                    "type": "dm",
+                    "from_nick": who,
+                    "content": entry.text or "",
+                    "time": entry.when or "",
+                    "event_id": entry.extra.get("event_id") or entry.key,
+                    "raw_frame_id": entry.extra.get("raw_frame_id", ""),
+                },
+                umo,
+            )
+            if decision.get("model") is False:
+                # 判断用的模型没就绪：不退化成哑巴，走下面「日常聊天」那条路照样回
+                logger.info("私信：判断模型没就绪，改用日常聊天回复")
+            elif not decision.get("reply"):
+                self.memory.remember(who, "them", entry.text or "")
+                return f"模型判断不回：{decision.get('reason') or '没给理由'}"
+            else:
+                text0 = str(decision.get("text") or "")
+                if text0:
+                    self._event_judged_reply = getattr(self, "_event_judged_reply", 0) + 1
+                    self.memory.remember(who, "them", entry.text or "")
+                    ok0, detail0 = await self.send_dm(who, text0, allow=[], check_limit=False)
+                    if ok0:
+                        self.memory.remember(who, "me", text0)
+                        if not unlimited:
+                            await self.limits.hit_async("dm")
+                        return f"回了：「{text0}」（模型判断：{decision.get('reason') or '—'}）"
+                    return f"回了但没发出去：「{text0[:20]}」（{detail0}）"
         qq_id = self._qq_of(who)
         memory = self.memory.background(
             person=who,
@@ -1131,33 +1394,127 @@ class DouyinLearningBot(Star):
         return f"回了：「{text}」"
 
     async def _handle_mention(self, page, entry: Entry, umo: str) -> str:
-        if not entry.aweme_id:
-            return "这条提醒拿不到视频 id，你可能得自己点开看"
-        item = await self.inbox.fetch_item(page, entry.aweme_id)
-        if item is None:
-            return "这条视频取不到详情（可能已下架）"
-        analysis = await self.pipeline._handle_one(item, 0.0, umo)
+        # 0.10.0：同一个人挂在队列里没回完的评论，直接丢新事件（一次针对一个用户只回一条）
+        uid = str(entry.extra.get("from_uid") or entry.who or entry.key)
+        if uid in self._mention_seen:
+            return f"「{uid}」已经排了一条没回完的，这条丢掉"
+        self._mention_seen[uid] = entry.key
+        try:
+            return await self._mention_work(page, entry, umo)
+        finally:
+            self._mention_seen.pop(uid, None)
+
+    def _entry_event(self, entry):
+        return {"type": {"dm_text": "dm", "dm_share": "share"}.get(entry.kind, entry.kind),
+                "from_nick": entry.who, "content": entry.text, "time": entry.when,
+                "event_id": entry.extra.get("event_id") or entry.key,
+                "raw_frame_id": entry.extra.get("raw_frame_id", ""),
+                "from_uid": entry.extra.get("from_uid", ""), "aweme_id": entry.aweme_id}
+
+    async def _mention_work(self, page, entry: Entry, umo: str) -> str:
+        # IM 私信里的「评论卡」和群聊 @ 都是 IM 语义，不能拿去公开评论区回复。
+        if str(entry.extra.get("channel") or "") == "im" or str(entry.extra.get("route") or "") == "dm":
+            return "IM 里的评论卡/群内@，不当公开评论处理"
         if not getattr(self.settings, "inbox_mention_reply", True):
-            return "看过了（回复开关是关的，没回）"
+            return "评论回复开关关闭，只记账"
+        text0 = ""
+        if getattr(self.settings, "agent_enabled", True):
+            decision = await self.agent.handle_douyin_event(self._entry_event(entry), umo)
+            if decision.get("model") is False:
+                text0 = ""  # 没有可用模型：退回 voice.reply 那条老路，别哑掉
+            elif not decision.get("reply"):
+                return "模型判断不回：" + (decision.get("reason") or "无有效判断")
+            else:
+                text0 = str(decision.get("text") or "")
+                if not text0:
+                    return "模型说回但没给话，按不回处理"
+                self._event_judged_reply = getattr(self, "_event_judged_reply", 0) + 1
+        if not text0:
+            try:
+                text0 = await self.voice.reply(their=entry.text or "",
+                                               title=getattr(entry, "src", "") or "", umo=umo)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("回评论时写句子失败：%s", exc)
+                text0 = ""
+            if not text0:
+                return "没想出合适的回法，不硬发"
+        if not entry.aweme_id:
+            return "视频 id 待补，保留通知记录"
+        mode = getattr(self.settings, "action_mode", "ask")
+        if mode == "off":
+            return "写操作关闭，只保留模型判断"
+        uid = str(entry.extra.get("from_uid") or entry.who)
+        pending = await self.store.inbox_pending("comment_reply", 200)
+        for row in pending:
+            payload = json.loads(row.get("payload") or "{}")
+            if payload.get("uid") == uid:
+                return "同用户已有待确认评论，这条跳过"
+        payload = {"uid": uid, "who": entry.who, "aweme_id": entry.aweme_id,
+                   "comment_id": str(entry.extra.get("comment_id") or ""),
+                   "text": text0, "created_at": time.time()}
+        if mode in {"ask", "confirm"}:
+            await self.store.inbox_add("comment_reply", entry.key, src=entry.who,
+                                      payload=json.dumps(payload, ensure_ascii=False))
+            await self._notify_text(umo, f"待确认评论回复 · {entry.who}\n{text0}\n/dy confirm 确认（12 小时有效）", umo=umo)
+            return "评论回复已入待确认队列"
+        if payload["comment_id"]:
+            return await self._send_comment_reply(payload)
+        return await self._send_mention_comment(payload)
+
+    async def _send_mention_comment(self, payload):
+        """@ 提醒的公开回法：在视频下发一条评论 @ 回对方。
+
+        没有原始评论 id 时不能冒充「回复某条评论」，但对方是 @ 了我才来的，
+        回给这个人本身不需要再过一遍白名单（不做无差别群发）。
+        """
+        aweme = str(payload.get("aweme_id") or "")
+        text = str(payload.get("text") or "")
+        if not aweme or not text:
+            return "视频 id 或内容缺，先不发"
+        who = str(payload.get("who") or "").strip()
         why = await self.limits.check_async("comment", self.settings)
         if why:
-            return f"看过了，但先不回：{why}"
-        text = ""
-        if analysis is not None:
-            text = await self.voice.reply(
-                their=entry.text or "",
-                title=item.desc or item.title,
-                analysis_summary=analysis.summary,
-                frames=[str(analysis.montage)] if analysis.montage else None,
-                umo=umo,
-            )
-        if not text:
-            return "看过了，但没想出怎么说（模型没给合格的一句），没回"
-        res = await self.social.comment(entry.aweme_id, text, [entry.who] if entry.who else [])
-        if not res.ok:
-            return f"回的时候失败：{res.detail}"
-        await self.limits.hit_async("comment")
-        return f"回了：{text}"
+            return "评论暂缓：" + why
+        res = await self.social.comment(aweme, text, [who] if who else [])
+        if res.ok:
+            await self.limits.hit_async("comment")
+            return "回了：" + text
+        return "评论发送未确认：" + str(getattr(res, "detail", ""))
+
+    async def _send_comment_reply(self, payload):
+        why = await self.limits.check_async("comment", self.settings)
+        if why:
+            return "评论暂缓：" + why
+        cid = str(payload.get("comment_id") or "")
+        if not cid:
+            return "原评论 id 待补，未发布顶层评论替代回复"
+        res = await self.social.reply_comment(payload["aweme_id"], cid, payload["text"])
+        if res.ok:
+            await self.limits.hit_async("comment")
+            return "回了：" + payload["text"]
+        return "评论发送未确认：" + res.detail
+
+    async def _confirm_comment_replies(self):
+        if getattr(self.settings, "action_mode", "ask") == "off":
+            return ["写操作关闭，评论队列保留"]
+        lock = getattr(self, "_comment_confirm_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._comment_confirm_lock = lock
+        async with lock:  # 两个人同时 /dy confirm 也只发一次
+            out = []
+            for row in await self.store.inbox_pending("comment_reply", 20):
+                payload = json.loads(row.get("payload") or "{}")
+                if time.time() - float(payload.get("created_at") or 0) > 43200:
+                    line = "评论确认已过期"
+                else:
+                    line = (await self._send_comment_reply(payload) if payload.get("comment_id")
+                            else await self._send_mention_comment(payload))
+                # Failed or rate-limited confirmations remain pending until TTL; never blind retry.
+                if line.startswith("回了：") or "过期" in line:
+                    await self.store.inbox_done("comment_reply", row["key"], line)
+                out.append(line)
+            return out
 
     # ---------------------------------------------------------------- 私信发送
     #
@@ -1613,6 +1970,7 @@ class DouyinLearningBot(Star):
     @filter.command("dy", alias={"抖音"})
     async def dy(self, event: AstrMessageEvent):
         self._last_umo = getattr(event, "unified_msg_origin", "") or ""
+        self._last_user_at = time.time()  # 自主刷拿它判断「人在不在」
         args = self._args(event.get_message_str())
         sub = args[0].lower() if args else ""
         sub = SUB_ALIASES.get(sub, sub)
@@ -2217,6 +2575,9 @@ class DouyinLearningBot(Star):
 
         if sub in {"confirm", "确认", "发出", "发出去"}:
             await self._ensure_ready()
+            comments = await self._confirm_comment_replies()
+            if comments:
+                yield event.plain_result("\n".join(comments))
             stats = await self.store.dm_stats()
             if not stats.get("pending"):
                 yield event.plain_result("没有待发的私信（/dy dm 状态 可以看发件箱）")
@@ -2420,21 +2781,35 @@ class DouyinLearningBot(Star):
 
     def _ensure_dm_watch(self) -> None:
         """同步版：在非 async 的启动路径里也能把守护挂上。"""
+        # 自主刷和私信守护解耦：私信关着也照样能自己刷
+        self._ensure_auto_think()
         if self._dm_task and not self._dm_task.done():
             return
-        if int(getattr(self.settings, "dm_chat_poll_s", 0) or 0) <= 0:
+        # 0.10.0：事件模式不依赖 dm_chat_poll_s（它是兜底间隔），只要日常聊天开着就起
+        if not getattr(self.settings, "dm_chat_enabled", False):
             return
         try:
             self._dm_task = asyncio.create_task(self._dm_watch_loop())
         except RuntimeError:  # 没有运行中的事件循环
             self._dm_task = None
 
+    def _ensure_auto_think(self) -> None:
+        if getattr(self, "_think_task", None) and not self._think_task.done():
+            return
+        if not getattr(self.settings, "autonomous_round", True):
+            return
+        try:
+            self._think_task = asyncio.create_task(self._auto_think_loop())
+        except RuntimeError:
+            self._think_task = None
+
     async def start_dm_watch(self) -> None:
         if self._dm_task and not self._dm_task.done():
             return
-        if int(getattr(self.settings, "dm_chat_poll_s", 0) or 0) <= 0:
+        if not getattr(self.settings, "dm_chat_enabled", False):
             return
         self._dm_task = asyncio.create_task(self._dm_watch_loop())
+        self._ensure_auto_think()
 
     async def stop_dm_watch(self) -> None:
         if self._dm_task and not self._dm_task.done():
@@ -2446,7 +2821,17 @@ class DouyinLearningBot(Star):
         self._dm_task = None
 
     async def terminate(self) -> None:
+        if getattr(self, "watcher", None) is not None:
+            await self.watcher.close()
         await self.stop_dm_watch()
+        think = getattr(self, "_think_task", None)
+        if think and not think.done():
+            think.cancel()
+            try:
+                await think
+            except Exception:  # noqa: BLE001
+                pass
+        self._think_task = None
         await self._cancel_loop()
         try:
             await self.jobs.stop()
