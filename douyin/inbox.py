@@ -65,6 +65,9 @@ class Entry:
 
 
 class Inbox:
+    """收件箱：私信 + @ 提醒。self.sent_lookup 由 main 挂上，自聊会话靠它去回声。"""
+
+    sent_lookup = None  # Callable[[str, int], set[str]] | None
     """扫两条来源。一个实例跟一个 browser 走。"""
 
     def __init__(self, browser, settings=None):
@@ -96,6 +99,11 @@ class Inbox:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("扫提醒失败：%s", exc)
         return out
+
+    def _self_names(self) -> list[str]:
+        raw = getattr(self.settings, "dm_self_names", "") or ""
+        raw = raw.replace("，", ",").replace("、", ",")
+        return [x.strip() for x in raw.split(",") if x.strip()]
 
     async def collect_dm(self, page, max_conversations: int = 8, max_cards: int = 3) -> list[Entry]:
         convs = await self.dm.conversations(page)
@@ -129,7 +137,11 @@ class Inbox:
                     )
                 )
             if chat_on and _allowed(conv.name, chat_allow):
-                for m in _incoming_texts(msgs, limit=max_cards):
+                echo = set()
+                if any(a == conv.name or a in conv.name or conv.name in a for a in self._self_names()):
+                    if callable(self.sent_lookup):
+                        echo = self.sent_lookup(conv.name, 30) or set()
+                for m in _incoming_texts(msgs, limit=max_cards, echo=echo):
                     out.append(
                         Entry(
                             kind="dm_text",
@@ -206,13 +218,21 @@ def _allowed(name: str, allow: list[str]) -> bool:
     return any(a == name or a in name or name in a for a in allow)
 
 
-def _incoming_texts(msgs: list, limit: int = 3) -> list:
-    """只取别人发来的、有内容的纯文本，最后 limit 条。"""
+def _incoming_texts(msgs: list, limit: int = 3, echo: set | None = None) -> list:
+    """只取别人发来的、有内容的纯文本，最后 limit 条。
+
+    echo：自聊会话（自己跟自己）专用 —— 那种会话里两边都标成"我发的"，
+    所以"不是我发过的那几句"才是对方刚打的。
+    """
+    echo = echo or set()
     out = []
     for m in msgs:
-        if m.kind != "text" or m.mine:
+        if m.kind != "text":
             continue
-        if not (m.text or "").strip():
+        text = (m.text or "").strip()
+        if not text:
+            continue
+        if m.mine and not (echo and text not in echo):
             continue
         out.append(m)
     return out[-limit:]
