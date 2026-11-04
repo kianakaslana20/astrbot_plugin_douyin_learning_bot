@@ -981,7 +981,13 @@ class DouyinLearningBot(Star):
                         ensure_ascii=False,
                     )):
                         fresh.append(e)
+                first = not getattr(self, "_dm_warmed", False)
+                self._dm_warmed = True
                 for e in fresh:
+                    if first:
+                        # 刚启动那一下只记账：历史积压不一次性回一遍
+                        await self.store.inbox_done(e.kind, e.key, "backlog")
+                        continue
                     try:
                         line = await self._handle_dm_text(e, self._last_umo or "")
                         logger.info("私信守护：%s", line)
