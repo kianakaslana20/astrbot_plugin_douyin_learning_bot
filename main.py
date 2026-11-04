@@ -896,6 +896,9 @@ class DouyinLearningBot(Star):
             return "看不懂这条（转写和画面都没读出来），没敢乱写"
         note = ""
         if getattr(self.settings, "inbox_share_summary", True):
+            why = await self.limits.check_async("summary", self.settings)
+            if why:
+                return f"这条先不写总结：{why}"
             note = await self.voice.summary(
                 title=item.desc or item.title,
                 author=item.author,
@@ -905,6 +908,8 @@ class DouyinLearningBot(Star):
                 frames=[str(analysis.montage)] if analysis.montage else None,
                 umo=umo,
             )
+        if note:
+            await self.limits.hit_async("summary")
         body = note or analysis.summary or ""
         head = f"{entry.who or '有人'} 发来的：{item.title[:30] or entry.aweme_id}"
         tail = f"\n　　https://www.douyin.com/video/{entry.aweme_id}"
