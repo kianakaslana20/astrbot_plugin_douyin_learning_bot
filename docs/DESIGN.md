@@ -1949,3 +1949,53 @@ if msg_type in CONTROL_MESSAGE_TYPES or "command_type" in data:
   内容层仍然只有 synthetic 背书 —— 字段号来自第三方重建 SDK + 这次的真实信封，
   内容层要等一条真消息才能完全落定。
 - `frontier-pc`（平台互动通知）没有抓到任何业务帧，这一路仍然是「收到帧 → 去界面读」。
+
+## 34. 解出来的私信要真的能回：WS 事件提升成一等条目（v0.11.2）
+
+### 34.1 0.11.1 停在哪
+
+0.11.1 把帧解对了，但 `_one_event_round` 里解码出来的事件只有两条出路：
+
+1. 界面上有同名同文的条目 → 给它补 `event_id / from_uid / timestamp / protocol`，然后按
+   DOM 条目走原来的链路；
+2. 界面上没有 → 写一条 `inbox(kind=ws_evidence)` 证据，`inbox_done(reason=decoded_wait_identity)`。
+
+第 2 条就是问题：真机上「收得到吗」这条私信只落在证据里，`dm_judge` 空表，一条回复都没有。
+解对了不等于会回。
+
+### 34.2 现在的三岔口
+
+| 界面里有几条能对上 | 处理 |
+|---|---|
+| 恰好一条 | 补身份（`protocol=True`）→ 按 DOM 条目走原链路 |
+| 一条都没有 | **造一条 `Entry`** 塞进本轮列表 → 走原链路 |
+| 两条以上（同名不同人） | 不补身份、不造条目，落证据等下轮 |
+
+「造条目」不是旁路：它进的是同一个 `entries` 列表，后面的 `inbox_add` 幂等、`baseline`
+记账、白名单 `dm_targets`、`limits.check_async("dm"/"dm_out")`、静默时段、`agent.handle_douyin_event`、
+`action_mode=ask` 的待确认，全部一样生效。区别只在于数据来源是协议层而不是界面。
+
+### 34.3 防重复
+
+`_ws_claimed(who, text, ttl=180)`：WS 已经处理过「这个人这句话」，后续 DOM 轮次再扫到同一条，
+记 `ws_dup` 跳过。带 `protocol` 标记的条目不受这条约束 —— 它就是本轮要处理的那一条，
+不能自己把自己拦掉（第一版就是这么错的，被测试当场抓住）。
+
+### 34.4 名字从哪来
+
+`from_nick` 在协议帧里是空的（消息体只给 `sender=uid`）。名字靠 `social._uid_cache` 反查：
+反查结果必须唯一，否则 `who=""`，既不造条目也不当公开评论 —— 宁可等界面，也不猜错人。
+
+### 34.5 验证
+
+- `tests/test_event_runtime.py`：`test_unmatched_raw_dm_is_promoted_not_dropped`（无 DOM 时
+  提升成条目、带 `protocol/source=ws`、不写 `ws_evidence`）、
+  `test_matching_raw_enriches_one_dom_and_not_replayed`（有 DOM 时只补身份、一轮只回一次）、
+  `test_duplicate_nickname_matches_do_not_inject_protocol_identity`（同名两条不注入、留证据）。
+- 真机：`收得到吗` 的帧 → `事件守护(ws)：解码 1 条`。
+
+### 34.6 仍缺
+
+- `frontier-pc` 平台互动通知的 schema 依旧没有证据，那一路只当 dirty 触发界面读。
+- 评论区「回复某一条评论」仍要求界面能给出评论 id；给不出就在视频下发一条 @（已在
+  0.11.0 里定下的保守做法）。
