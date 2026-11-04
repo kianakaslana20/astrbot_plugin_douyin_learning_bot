@@ -173,6 +173,8 @@ class Settings:
     quiet_window: bool = True      # 把浏览器窗口挪到屏幕外，后台跑不抢焦点（headless 会被风控，只能这样）
     profile_dir: str = ""
     channel: str = "msedge"          # msedge = 用系统 Edge 内核（默认）；"" = Playwright 自带 chromium
+    channel_strict: bool = False     # True = Edge 起不来就直接报错，不偷偷退回 chromium
+    profile_pin: bool = False        # True = 钉死当前 profile 目录，自动迁移一律不做
     cookie_source: str = "auto"      # auto = profile 没登录时先试着从本机 Edge/Chrome 借一次
     window_on_login: bool = True    # 需要人扫码/过验证时，自动把窗口摆到桌面上（不用再找）
     cookie_string: str = ""          # 粘贴整条 cookie 串（浏览器 F12 里原样复制，只填 k=v; k=v）
@@ -231,10 +233,18 @@ class Settings:
     mention_targets: list[str] = field(default_factory=list)
     comment_template: str = ""
     action_delay_s: int = 6
+    action_jitter: bool = True      # 间隔随机化（固定节奏本身就是指纹）
     max_actions_per_round: int = 2
     action_dump: bool = True
 
     # 文案层：让对话模型 + AstrBot 人格写评论，而不是套模板
+    inbox_dm: bool = True
+    inbox_mentions: bool = True
+    inbox_max_conversations: int = 8
+    inbox_max_cards: int = 3
+    inbox_share_summary: bool = True
+    inbox_mention_reply: bool = True
+    dm_allow: str = ""
     voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
     voice_persona: str = ""        # 人格名；留空 = 用该会话的默认人格
     voice_max_chars: int = 40      # 一条评论多少字以内
@@ -243,6 +253,16 @@ class Settings:
     voice_banned: str = ""         # 额外禁词，逗号分隔（内置一份 AI 腔词表）
     # 白名单：开了以后只允许对 share_targets / mention_targets 里的人动手，命令里临时写别的名字会被拒
     enforce_allowlist: bool = True
+
+    # 频率与静默时段（写操作的闸门，计数落 sqlite，重载不清零）
+    rate_enabled: bool = True
+    rate_comment_per_day: int = 8     # 每天最多发几条评论
+    rate_share_per_day: int = 10      # 每天最多分享几次
+    rate_like_per_day: int = 30       # 每天最多点几个赞
+    rate_dm_per_hour: int = 6         # 每小时最多回几条私信（留给 0.9.x）
+    quiet_hours: str = ""             # 例 "01:00-08:00"，这段时间不发任何东西
+    pending_ttl_hours: int = 12       # ask 模式攒下的待执行动作，超过这么久作废
+    keep_days: int = 30               # 记录与临时文件保留多少天，0 = 不清
 
     # 后台 / 通知
     notify_start: bool = False     # 一轮开跑时先说一句（后台循环容易刷屏，默认关）
@@ -288,6 +308,8 @@ class Settings:
             quiet_window=_as_bool(br.get("quiet_window"), True),
             profile_dir=_as_str(br.get("profile_dir"), ""),
             channel=_as_str(br.get("channel"), "msedge"),
+            channel_strict=_as_bool(br.get("channel_strict"), False),
+            profile_pin=_as_bool(br.get("profile_pin"), False),
             cookie_source=_as_str(br.get("cookie_source"), "auto").lower(),
             window_on_login=_as_bool(br.get("window_on_login"), True),
             cookie_string=_as_str(br.get("cookie_string"), ""),
@@ -324,15 +346,31 @@ class Settings:
             mention_targets=_as_list(ac.get("mention_targets")),
             comment_template=_as_str(ac.get("comment_template"), ""),
             action_delay_s=_as_int(ac.get("action_delay_s"), 6, 2, 120),
+            action_jitter=_as_bool(ac.get("action_jitter"), True),
             max_actions_per_round=_as_int(ac.get("max_actions_per_round"), 2, 0, 20),
             action_dump=_as_bool(ac.get("action_dump"), True),
-            voice_enabled=_as_bool(ac.get("voice_enabled"), True),
+            inbox_dm=_as_bool(ac.get("inbox_dm"), True),
+        inbox_mentions=_as_bool(ac.get("inbox_mentions"), True),
+        inbox_max_conversations=_as_int(ac.get("inbox_max_conversations"), 8, 1, 30),
+        inbox_max_cards=_as_int(ac.get("inbox_max_cards"), 3, 1, 10),
+        inbox_share_summary=_as_bool(ac.get("inbox_share_summary"), True),
+        inbox_mention_reply=_as_bool(ac.get("inbox_mention_reply"), True),
+        dm_allow=_as_str(ac.get("dm_allow"), ""),
+        voice_enabled=_as_bool(ac.get("voice_enabled"), True),
             voice_persona=_as_str(ac.get("voice_persona"), ""),
             voice_max_chars=_as_int(ac.get("voice_max_chars"), 40, 6, 200),
             voice_frames=_as_int(ac.get("voice_frames"), 1, 0, 4),
             voice_timeout_s=_as_int(ac.get("voice_timeout_s"), 60, 5, 300),
             voice_banned=_as_str(ac.get("voice_banned"), ""),
             enforce_allowlist=_as_bool(ac.get("enforce_allowlist"), True),
+            rate_enabled=_as_bool(ac.get("rate_enabled"), True),
+            rate_comment_per_day=_as_int(ac.get("rate_comment_per_day"), 8, 0, 500),
+            rate_share_per_day=_as_int(ac.get("rate_share_per_day"), 10, 0, 500),
+            rate_like_per_day=_as_int(ac.get("rate_like_per_day"), 30, 0, 999),
+            rate_dm_per_hour=_as_int(ac.get("rate_dm_per_hour"), 6, 0, 500),
+            quiet_hours=_as_str(ac.get("quiet_hours"), ""),
+            pending_ttl_hours=_as_int(ac.get("pending_ttl_hours"), 12, 0, 168),
+            keep_days=_as_int(ac.get("keep_days"), 30, 0, 3650),
         )
 
         bg = _section(config, "notify") or _section(config, "background")
