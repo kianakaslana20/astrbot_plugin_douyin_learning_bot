@@ -30,6 +30,19 @@ AWEME_RE = re.compile(r"(?:modal_id=|/video/|/note/|aweme_id=)(\d{12,25})")
 URL_RE = re.compile(r"https?://v\.douyin\.com/[A-Za-z0-9]+|https?://www\.douyin\.com/video/\d+")
 
 
+_WHEN_RE = re.compile(r"(?:\d{1,2}:\d{2}|周[一二三四五六日]|昨天|前天|\d{1,2}/\d{1,2})$")
+
+
+def _strip_when(text: str) -> str:
+    """把会话标题尾部的时间削掉：`大肥鱼Yume10:37` → `大肥鱼Yume`。"""
+    name = (text or "").strip().split("\n")[0].strip()
+    for _ in range(2):
+        cut = _WHEN_RE.sub("", name).strip()
+        if cut == name:
+            break
+        name = cut
+    return name
+
 @dataclass
 class Conversation:
     name: str
@@ -161,18 +174,45 @@ class DirectMessages:
               return cands[0];
             }"""
         )
+        # 顶栏是 React 后渲染的：goto 回来立刻找入口会落空，所以先等它出现
+        # im 的 SDK 要 10~15 秒才把入口挂上（im-entry 出现之前点它没用）
+        for _ in range(25):
+            if box:
+                break
+            await page.wait_for_timeout(1000)
+            box = await page.evaluate(
+                """() => {
+                  const direct = document.querySelector('[data-e2e="im-entry"]');
+                  const pick = (el) => { const r = el.getBoundingClientRect();
+                    return r.width < 4 ? null : {x: r.x + r.width / 2, y: r.y + r.height / 2}; };
+                  if (direct) { const b = pick(direct); if (b) return b; }
+                  const cands = [];
+                  for (const el of document.querySelectorAll('ul,li,span,div,a')) {
+                    if ((el.textContent || '').replace(/\\s+/g, '').trim() !== '消息') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 4 || r.height < 4) continue;
+                    cands.push({x: r.x + r.width / 2, y: r.y + r.height / 2, area: r.width * r.height});
+                  }
+                  if (!cands.length) return null;
+                  cands.sort((a, b) => a.area - b.area);
+                  return cands[0];
+                }"""
+            )
         if not box:
-            logger.warning("私信：找不到「消息」入口")
+            logger.warning("私信：找不到「消息」入口（顶栏没渲染出来）")
             return False
-        await page.mouse.move(box["x"] - 30, box["y"])
-        await page.wait_for_timeout(400)
-        await page.mouse.move(box["x"], box["y"])
-        await page.wait_for_timeout(500)
-        await page.mouse.click(box["x"], box["y"])
-        for _ in range(10):
+
+        for attempt in (1, 2, 3):
+            await page.mouse.move(box["x"] - 30, box["y"])
+            await page.wait_for_timeout(400)
+            await page.mouse.move(box["x"], box["y"])
             await page.wait_for_timeout(500)
-            if await self._panel_visible(page):
-                return True
+            await page.mouse.click(box["x"], box["y"])
+            for _ in range(8):
+                await page.wait_for_timeout(500)
+                if await self._panel_visible(page):
+                    return True
+            logger.info("私信：第 %s 次点「消息」没开出来，再试", attempt)
         return False
 
     async def close_panel(self, page) -> None:
@@ -312,30 +352,205 @@ class DirectMessages:
         """哪些是「别人发过来的视频」：带 aweme_id 的分享卡，去掉自己发的。"""
         return [m for m in messages if m.kind == "share" and m.aweme_id and not m.mine]
 
+    # ------------------------------------------------------------------ 私信发送
+
+    async def last_mine_text(self, page) -> str:
+        """我自己发的最后一条（含分享卡标题）；只作诊断用。"""
+        try:
+            items = await page.evaluate(
+                """() => [...document.querySelectorAll('[data-e2e="msg-item-content"]')]
+                  .filter(el => el.closest('[class*="isFromMe"]'))
+                  .map(el => (el.innerText || '').trim())
+                  .filter(t => t)"""
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+        return items[-1] if items else ""
+
+
+    async def resolve_target(self, page, target: str) -> dict | None:
+        """在会话列表里按昵称找人，返回 {uid, name}。
+
+        两个实测坑：会话行的 innerText **没有换行**（`昵称10:37预览…`），名字只能
+        从 title 元素取再把尾部时间削掉；会话行上也没有 `data-userid`（那只在分享
+        面板里），所以纯数字 uid 由调用方先用缓存换成昵称。面板刚开时列表为空，
+        所以这里轮询等它渲染。
+        """
+        target = (target or "").strip()
+        if not target:
+            return None
+        rows = []
+        for _ in range(12):
+            try:
+                rows = await page.evaluate(
+                    """() => [...document.querySelectorAll('[data-e2e="conversation-item"]')]
+                      .map(r => {
+                        const t = r.querySelector('[class*="conversationConversationItemtitle"]');
+                        const holder = r.hasAttribute('data-userid') ? r : r.querySelector('[data-userid]');
+                        return {name: t ? (t.innerText || '') : '',
+                                uid: holder ? (holder.getAttribute('data-userid') || '') : ''};
+                      })"""
+                )
+            except Exception:  # noqa: BLE001
+                rows = []
+            if rows:
+                break
+            await page.wait_for_timeout(800)
+        cleaned = []
+        for row in rows or []:
+            name = _strip_when(row.get("name") or "")
+            if name:
+                cleaned.append({"uid": row.get("uid") or "", "name": name})
+        if not cleaned:
+            logger.warning("私信：会话列表还是空的（面板开没？）")
+            return None
+        is_num = bool(re.fullmatch(r"[0-9]{6,20}", target))
+        for row in cleaned:
+            if row["uid"] and row["uid"] == target:
+                return row
+        for row in cleaned:
+            if row["name"] == target:
+                return row
+        if not is_num:
+            for row in cleaned:
+                if target in row["name"] or row["name"] in target:
+                    return row
+        logger.warning("私信：列表里有 %s 个会话，没有「%s」（%s）",
+                       len(cleaned), target, "/".join(x["name"] for x in cleaned[:6]))
+        return None
+
+    async def send_dm(self, page, target: str, text: str, allow=None,
+                      readback: bool = True) -> tuple:
+        """给某个人发一条私信：走界面，发完回读校验，失败重试一次。
+
+        返回 (成功?, 说明)；说明里带昵称/uid，方便写回执与排查。
+        """
+        text = (text or "").strip()
+        if not text:
+            return False, "内容是空的"
+        # 私信抽屉只挂在首页顶栏：页面停在视频详情/空白页时顶栏不完整，先回首页
+        try:
+            if "douyin.com" not in (page.url or ""):
+                await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(1500)
+        except Exception:  # noqa: BLE001
+            pass
+        if not await self.open_panel(page):
+            return False, "没打开私信面板（顶栏的「消息」没点到）"
+
+        who = await self.resolve_target(page, target)
+        if not who or not (who.get("name") or who.get("uid")):
+            return False, f"会话列表里找不到「{target}」"
+        name, uid = who.get("name") or "", who.get("uid") or ""
+
+        if allow is not None:
+            hit = any(
+                a and (a == name or a in name or name in a or (uid and a == uid))
+                for a in allow
+            )
+            if not hit:
+                return False, f"「{name or target}」不在私信白名单里（私信 → dm_targets）"
+
+        if not await self.open_conversation(page, name or target):
+            return False, f"点不进「{name or target}」的会话"
+        head = await self.chat_name(page)
+        head0 = (head or "").split("\n")[0].strip()
+        if head0 and name and head0 != name and name not in head0:
+            return False, f"进去的会话不对（头部是「{head0}」，要的是「{name}」）"
+
+        ok = await self.send_text(page, text)
+        if not ok:
+            return False, "没找到输入框（msg-input），这条没发出去"
+        if not readback:
+            return True, f"已发给「{name}」（未回读）"
+
+        # 回读：先等它渲染（最多 6 秒），别急着补发 —— 补发会变成两条一样的
+        for _ in range(6):
+            await page.wait_for_timeout(1000)
+            if await self.sent_ok(page, text):
+                return True, f"已发给「{name}」并回读确认"
+
+        # 确认没发出去：先看字是不是还留在输入框，留着就再按一次回车
+        left = await self.editor_text(page)
+        if left and text[:8] in left:
+            await page.keyboard.press("Enter")
+            for _ in range(4):
+                await page.wait_for_timeout(1000)
+                if await self.sent_ok(page, text):
+                    return True, f"已发给「{name}」并回读确认（补按了一次回车）"
+        # 还不行就重打一遍再发
+        ok = await self.send_text(page, text)
+        if ok:
+            for _ in range(4):
+                await page.wait_for_timeout(1000)
+                if await self.sent_ok(page, text):
+                    return True, f"已发给「{name}」并回读确认（重发一次后成功）"
+        tail = (await self.last_mine_text(page))[:24]
+        return False, f"回读没看到这条（最后一条是「{tail}」），可能被风控吞了"
+
     # ------------------------------------------------------------------ 发消息
 
     async def send_text(self, page, text: str) -> bool:
-        """在当前会话里发一句话（走界面，Enter 发送）。"""
+        """在私信输入区打字并发出。
+
+        `[data-e2e="msg-input"]` 只是外壳，真正的可编辑区在里面
+        （`div.editor-kit-container`）；Enter 只对新起一行为空时才发，所以打完
+        直接按回车即可。
+        """
         text = (text or "").strip()
         if not text:
             return False
-        box = await page.evaluate(
-            """() => {
-              const el = document.querySelector('[data-e2e="msg-input"]');
-              if (!el) return null;
-              const r = el.getBoundingClientRect();
-              return {x: r.x + Math.min(60, r.width / 2), y: r.y + r.height / 2};
-            }"""
-        )
-        if not box:
-            return False
-        await page.mouse.click(box["x"], box["y"])
+        try:
+            editor = page.locator("div.editor-kit-container").last
+            await editor.click(timeout=6000)
+        except Exception:  # noqa: BLE001
+            try:
+                await page.click('[data-e2e="msg-input"]', timeout=4000)
+            except Exception:  # noqa: BLE001
+                logger.warning("私信：点不到输入框")
+                return False
+        await page.wait_for_timeout(250)
+        try:
+            await page.keyboard.insert_text(text)
+        except Exception:  # noqa: BLE001
+            await page.keyboard.type(text)
         await page.wait_for_timeout(400)
-        await page.keyboard.insert_text(text)
-        await page.wait_for_timeout(500)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(900)
         return True
+
+    async def editor_text(self, page) -> str:
+        """输入区里还没发出去的内容。"""
+        try:
+            return await page.evaluate(
+                """() => { const e = document.querySelector('div.editor-kit-container');
+                  return e ? (e.innerText || '').trim() : ''; }"""
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def panel_text(self, page) -> str:
+        """整个私信抽屉的可见文本。"""
+        try:
+            return await page.evaluate(
+                """() => { const d = document.querySelector('[data-e2e="im-dialog"]');
+                  return d ? (d.innerText || '') : ''; }"""
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def sent_ok(self, page, text: str) -> bool:
+        """发出去了吗：输入区已清空 **且** 抽屉里能看到这句话。"""
+        text = (text or "").strip()
+        if not text:
+            return False
+        left = await self.editor_text(page)
+        if left and text[:8] in left:
+            logger.info("私信：字还留在输入框里（%s 字），没发出去", len(left))
+            return False
+        body = await self.panel_text(page)
+        return text[:8] in body
+
 
 
 def extract_urls(text: str) -> list[str]:
