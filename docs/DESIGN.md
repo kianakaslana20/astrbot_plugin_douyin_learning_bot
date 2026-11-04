@@ -2017,3 +2017,102 @@ if msg_type in CONTROL_MESSAGE_TYPES or "command_type" in data:
 
 真机证据：库里那条 `im:0:1:4330304429101319:4330304429101319:7704391562680272442`
 的会话两侧都是 4330304429101319，正是这个场景。
+
+## 35. 把写操作的闸门拆成「按种类」（v0.12.0）
+
+### 35.1 之前错在哪
+
+`action_mode` 是一把总闸门，只有 `off / ask / auto` 三档：
+
+```python
+mode = self.settings.action_mode
+if mode == "ask":
+    self._pending = result.analyzed[:max]
+    return "这条要分享/评论吗？回 /dy do 执行"
+```
+
+`auto_comment`、`auto_like` 两个字段从 0.6 起就在配置和面板里，但**没有任何一行代码读它们**
+（`grep auto_comment` 只命中 `config.py` 的定义）。用户看到的「每次都要问」就是这个原因：
+`ask` 把点赞、分享、评论捆成一包，一起等人点头。
+
+### 35.2 拆法
+
+```python
+def _auto_kinds(self) -> set[str]:
+    mode = (self.settings.action_mode or "off").lower()
+    if mode == "off":
+        return set()
+    if mode == "auto":
+        return {"like", "share", "comment"}
+    kinds = set()
+    if self.settings.auto_comment:
+        kinds.add("comment")
+    if self.settings.auto_like:
+        kinds.add("like")
+    return kinds
+```
+
+- 总闸门语义不变：`off` 永远不动手。
+- `auto` 仍然「三类全自动」。
+- `ask` 不再是「全都问」，而是「问掉剩下的」：自动集合先发，差集（`rest`）入
+  `self._pending`，并把种类记进 `self._pending_kinds`；`/dy do` 按这个集合补跑。
+
+`_do_actions` 多了一个 `kinds` 参数，三个分支各自判断：
+
+```python
+do_like    = want is None or "like" in want
+do_share   = want is None or "share" in want
+do_comment = want is None or "comment" in want
+...
+text = await self._comment_text(item, analysis) if do_comment else ""
+```
+
+分享那段还要额外短路——`check_targets()` 会读白名单，没打算分享就别去读：
+
+```python
+wanted, _rejected = (
+    self.settings.check_targets(list(self.settings.share_allowlist), kind="share")
+    if do_share else ([], [])
+)
+```
+
+### 35.3 点赞为什么不再看 `auto_like`
+
+`_do_actions` 原来写的是 `if self.settings.auto_like and not acted(...)`，于是「kind 说要
+点赞」和「auto_like 是 false」会打架：`action_mode=auto` 时明明说了三类全做，点赞却被
+单项开关挡住。现在把判断收敛到一处 —— **`kinds` 说了算**，`auto_like` 只在 `_auto_kinds()`
+里影响「哪种动作进自动集合」。一条规则，一个地方。
+
+### 35.4 去重与上限没动
+
+- `store.acted(aweme_id, kind, key)` 仍在，`/dy do` 补跑时不会把自动发过的评论再来一遍。
+- `limits.check_async("comment")` / `hit_async` 仍在，`rate_comment_per_day` 到了就写
+  「跳过评论：今天已经评论 N 条…」。
+- 静默时段在 `_do_actions` 最前面就 return，一条都不会发。
+
+### 35.5 验证
+
+`E:\工作区\_test_dy_actions.py` 20 项：off/ask/auto 三档 × 两个单项开关的自动集合、
+`kinds` 三种过滤、空集合什么都不做、不给 `kinds` 仍三类全做（老调用兼容）、
+`ask` 下评论当场发而分享入队、上限拦截、回执文案。
+
+### 35.7 顺手修的：掉登录不再默默失败
+
+私信守护原来不看登录态，掉登录之后每轮点「消息」都会被「登录后即可查看私信消息」挡回来，
+日志只有四行「第 N 次点「消息」没开出来」，外面看不出是没登录。现在循环开头先问一句：
+
+```python
+if not await self._dm_logged_in():
+    await self._dm_login_notice()
+    await asyncio.sleep(60)
+    continue
+```
+
+`_dm_logged_in()` 用 `browser.logged_in(launch=False)`（不主动开浏览器，查不出来就当已登录），
+`_dm_login_notice()` 复用 `_ensure_login` 那套：搬窗口 → `login_qr()` 截图 →
+`_ask_help(tip, qr)`，并用 `_login_notice_at` 做十分钟节流。
+
+### 35.6 仍缺
+
+- 评论文案仍来自 `comment_template`（默认 `{summary}`），没有针对视频内容单独起一段话。
+- 分享要不要也默认自动，是产品决定，现在留给 `action_mode=auto`。
