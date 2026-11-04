@@ -380,6 +380,42 @@
         "description": "强制白名单",
         "default": true,
         "hint": "开：只对两个白名单里的人动手（/dy share 里临时点的名字也会被拦）；关：谁都能发（不建议）"
+      },
+      "voice_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "用对话模型写评论（关掉就退回模板）",
+        "hint": "打开后评论由当前对话模型 + 本插件所在会话的 AstrBot 人格生成，看的是这条视频的抽帧拼图和转写摘要，不是套 comment_template。模型不可用 / 写不合格才退回模板。"
+      },
+      "voice_persona": {
+        "type": "string",
+        "default": "",
+        "description": "用哪个人格（留空 = 当前会话默认人格）",
+        "hint": "填人格名，例如「大肥鱼」。留空就用该会话的默认人格，跟你在 QQ 上说话一致。"
+      },
+      "voice_max_chars": {
+        "type": "int",
+        "default": 40,
+        "description": "一条评论最多几个字",
+        "hint": "越短越像随手留的。30~50 比较自然，超过 80 就开始像影评了。"
+      },
+      "voice_frames": {
+        "type": "int",
+        "default": 1,
+        "description": "给模型看几张图（0=只看文字）",
+        "hint": "1 = 送那张抽帧拼图（4 格），够模型判断画面类型；0 = 只给标题和摘要，快且便宜。"
+      },
+      "voice_timeout_s": {
+        "type": "int",
+        "default": 60,
+        "description": "等模型多久（秒）",
+        "hint": "超时就退回模板，不会卡住整轮。"
+      },
+      "voice_banned": {
+        "type": "string",
+        "default": "",
+        "description": "额外禁词（逗号分隔）",
+        "hint": "内置一份 AI 腔黑名单（首先/其次/综上/这个视频/干货满满…），命中会重写一次。这里补你自己的：比如某个口头禅、某个不能提的词。"
       }
     }
   },
