@@ -1727,3 +1727,67 @@ wss://frontier-im.douyin.com/ws/v2`、发送走 `/v1/message/send` 且要 SDK to
 ### 30.5 验证
 真机 `send_dm → True | 已发给「大肥鱼Yume」并回读确认`；
 单测 `_test_dy_dm_send.py` 23/0；`_test_dy_inbox.py` 23/0。
+
+## 31. 事件触发与模型判断（v0.10.0）
+
+### 31.1 为什么要改
+
+| 旧做法 | 问题 |
+|---|---|
+| `dm_chat_poll_s=60` 每 60 秒扫一次私信 | 消息来了最多等 1 分钟；没消息也每 60 秒开一次抽屉 |
+| `loop_interval_min=90` 每 90 分钟刷一轮 | 刷不刷由时钟决定，不看「有没有值得看的」 |
+
+### 31.2 WebSocket 实测（这是能不能做事件的前提）
+
+60 秒采样，`localStorage` 之外只看网络：页面起 5 条 WS。
+
+| URL | recv | 内容 |
+|---|---|---|
+| `frontier-im.douyin.com/ws/v2?...device_id=4330304429101319` | 3 | 全 `hi`（心跳） |
+| `frontier-im.douyin.com/ws/v2?aid=6383&fpid=9` | 2 | 全 `hi` |
+| `frontier-pc.douyin.com/ws/v2?...conn_tag=aweme_pc_web` | 2 | 全 `hi` |
+| `bytelink100-ws.douyin.com/bytelink/wss/v1/` | 12 | protobuf（埋点） |
+
+结论：**通道在，业务帧是 protobuf**。设计上不赌解析，只做信号：
+
+```python
+HEARTBEATS = (b"hi", b"", "hi", "")
+# 命中非心跳且长度 >= 32 → dirty=True
+```
+
+### 31.3 四层
+
+- 信号层 `ImWatcher`：`frames / signals / last_signal / dirty`，`take()` 取走脏标记。
+- 判断层 `DouyinAgent`：`_EVENT_RULES` / `_ROUND_RULES` 两套 prompt，人设拼进 system，
+  输出只认 JSON（带 ``` 围栏也能抠出来）。
+- 执行层：私信走 `social.send_dm`（发完回读），刷视频走 `jobs.submit`（仍是单 worker 串行）。
+- 兜底层：`_wait_signal` 等不到就按 `poll_fallback_min` 兜一次。
+
+### 31.4 幂等与去重
+
+- 收件箱 `inbox(kind, key)` 唯一索引：同一条私信/同一句评论只处理一次。
+- `_mention_seen[uid]`：同一个人没回完就不再接新事件，回完在 `finally` 里释放。
+- 判重键：私信 `dm:<aweme_id>` / `dt:<sha1>`，评论 `mt:<aweme_id 或 who>:<正文前16字>`。
+
+### 31.5 预算
+
+| 预算 | 键 | 默认 |
+|---|---|---|
+| 回私信 | `rate_dm_per_hour` | 6 |
+| 主动私信 | `rate_dm_out_per_hour` / `rate_dm_out_per_day` | 3 / 20 |
+| 评论 | `rate_comment_per_day` | 8 |
+| 自主刷 | `auto_rounds_per_day` / `auto_items_per_day` | 4 / 8 |
+
+`dm_targets`（自己人）免计数，但静默时段仍然生效 —— 免的是「骚扰陌生人」那条线，不是免「半夜别出声」。
+
+### 31.6 验证
+
+`_test_dy_agent.py` 38 项：WS 心跳过滤/信号计数/断线判定、模型说回/说不回/说回但没话/没模型、
+take 夹到 1~5、事件进 `dm_judge`、私信走模型判断、自己人免限流、静默仍拦、同一 uid 只回一条、
+自主刷预算与「模型说不刷就不提交」。
+
+### 31.7 遗留
+
+- protobuf 没解：只知道「有动静」，不知道具体是谁说了什么 —— 多一次界面读取代价。
+- 自主刷仍然是「排在队列里跑」，浏览器不是常驻热态，冷启动约 3~5 秒。
+- 事件来源只有私信 + 提醒面板；评论区的实时流没接（那是另一套 `comment/list` 轮询）。
