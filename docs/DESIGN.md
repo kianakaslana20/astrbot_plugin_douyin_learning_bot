@@ -1870,3 +1870,82 @@ IM 里的「评论卡」和「群内 @」是 IM 语义 —— 在群聊里 @ 你
 - 平台互动通知(frontier-pc) schema 未知；评论 `comment_id` 的真实链路（点通知 → 打开 → 取 id）
   没实测过，DOM 里读到的 `comment_id` 只能标 synthetic。
 
+
+## 33. 真机帧校验：50001 是红点同步，不是消息（v0.11.1）
+
+### 33.1 怎么拿到真字节的
+
+`action_dump` 打开时，`ImWatcher` 把收到的帧和发出去的帧都落一份到
+`<plugin_data>/ws_dumps/frames.jsonl`（base64 + 路由 + 方向，超过 4 MB 就不再写）。
+只留字节、不写日志，事后离线跑 `decode_frame` 就行 —— 比在日志里印十六进制干净。
+
+### 33.2 真实帧长什么样
+
+1.2 KB，`route=im dir=in`，通用 protobuf 字段树：
+
+```
+1 varint = 69589881            # seqid
+2 varint = 1793817403359...    # logid
+3 varint = 5                   # service
+4 varint = 1                   # method
+5 msg x5                       # headers：x_frontier_recieved_time / x_frontier_msg_id / traceparent …
+7 str "pb"                     # payload 类型
+8 msg[832]                     # payload
+  1 varint = 500               # cmd
+  3 varint = 0                 # status_code
+  6 msg[782]                   # body
+    500 msg[778]               # NewMessageNotify
+      2 str "0:1:4330...:4330..."   # conversation_id
+      5 msg[664]               # MessageBody
+        3 varint 7704386968990386747  # server_message_id
+        5 varint 7702532038129091121  # conversation_short_id
+        6 varint 50001                # message_type
+        7 varint 4330304429101319     # sender（本人 uid）
+        8 str  {"command_type":14,…}  # content
+        9 msg x4  s:client_message_id / s:command_type …
+        10 varint 1793817403227       # create_time(ms)
+        14 str "MS4wLjABAAAA…"         # sec_sender
+```
+
+结论：**0.11.0 钉的字段号和真实帧一致**（payload=8、cmd=1、body=6、body500、
+MessageBody 的 3/5/6/7/8/10/14 全对上），不用改 schema。
+
+### 33.3 唯一的真错：50001 被当成消息
+
+`message_type=50001` 的 content 是红点/已读同步（`command_type=14`、
+`mute_read_badge_count_info`），不是人发的话。0.11.0 里它落进 `unsupported_message_type`
+分支 → `dirty=True` → 守护循环每帧去界面读一遍。实测一分钟 8 帧就是 8 轮 DOM 读取。
+
+改成 control：
+
+```python
+if msg_type in CONTROL_MESSAGE_TYPES or "command_type" in data:
+    result.diagnostics.append(f"control_message:{msg_type}")
+    result.dirty = False
+    return
+```
+
+`CONTROL_MESSAGE_TYPES = {50001}` 只是实测到的那一个；`content` 里带 `command_type`
+这个条件负责兜住以后新出现的命令类推送（它们的 data 一定不是聊天字段）。
+
+### 33.4 信封判定放宽
+
+原来是 `for tag in (1, 2, 3, 4): 缺一个就 unknown_frame_schema`。真实帧刚好四个都有，
+但这属于运气 —— 改成「1..4 里至少有一个 varint」即认作带信封的帧，剩下的交给
+`payload_type` 判定。
+
+### 33.5 验证
+
+- `tests/test_wsproto.py` 新增 `RealFrameTest`（本地 fixture 在则跑，否则 skip）：
+  真实帧必须 `events==[]`、`dirty is False`、诊断含 `control_message:`；
+  另外把真实帧的信封逐层拆开断言 `7=='pb'`、payload 的 `cmd==500`。
+- 全套 `80 tests OK`。
+- 真机：改完重启后同一时间段 `事件守护(ws)` 轮次为 **0**（之前每帧一次），
+  4 条真实帧全部落在 control 分支。
+
+### 33.6 仍然没有的证据
+
+- 还没抓到**真人发来的聊天消息**帧（`message_type=7` 的真字节）。文本/分享/评论卡的
+  内容层仍然只有 synthetic 背书 —— 字段号来自第三方重建 SDK + 这次的真实信封，
+  内容层要等一条真消息才能完全落定。
+- `frontier-pc`（平台互动通知）没有抓到任何业务帧，这一路仍然是「收到帧 → 去界面读」。
