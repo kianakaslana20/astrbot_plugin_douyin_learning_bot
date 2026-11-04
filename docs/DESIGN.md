@@ -1666,3 +1666,38 @@ yezheyue 朋友 模型里面有敏感限制吗[看]我想给我家鱼安排上@�
 
 守护起来的第一轮如果直接回，会把「这几天你发给自己的每句话」一次性回一遍。
 所以第一轮标记 `_dm_warmed` 之前，条目只 `inbox_done(..., "backlog")`，不回。
+
+## 29. 三件事一个根：窗口 / 私信 / 登录（v0.9.6）
+
+### 29.1 症状与真因对照
+
+| 报上来的现象 | 第一层解释 | 真因 |
+|---|---|---|
+| 窗口配了 `quiet_window:false` 仍看不见 | 「窗口被藏到屏幕外」 | 进程压根没起：`profile_dir` 是 chromium 目录，`channel=msedge`，`channel.lock` 直接拒 |
+| 抖音私信不回 | 「守护没在跑」 | 同一个拒启动，每 60 秒抛一次，只写日志 |
+| 登录态老掉 | 「cookie 没存住」 | 同一 `sessionid` 被多份 profile / 多个核心同时使用，服务端按新设备吊销 |
+
+### 29.2 窗口位置的三次翻车
+
+1. 无 `--window-position` → 继承 profile 上次位置（`-26214`）；
+2. 给了 `-32000`（静默模式）→ 人找不到；
+3. 改 `quiet_window=false` 但仍无坐标 → 继承上次的 `-1525`（左边界外）；再试又变成 `-25600`（最小化态，rect 只剩标题栏 159×27）。
+   最终解法：**显式坐标 + 启动后 `show_window()`**（CDP `setWindowBounds` + Win32 `ShowWindow(SW_RESTORE)`）。
+
+### 29.3 登录被顶号的三个来源（都实测过）
+
+- 复制 profile 多开：三份副本同一 `sessionid` → `profile/self` 回 `status_code:8`；
+- 两个核心进程：launcher 起的 + 手工起的，各开一个浏览器共用一份 profile；
+- 混内核：chromium 写、msedge 读 → `exitCode=2147483651 STATUS_BREAKPOINT`。
+
+对策是三条硬约束：一份 profile、一个内核（`channel_strict`）、一个核心（`profile_pin`）。
+
+### 29.4 重载语义
+
+`/dy reload` 走 AstrBot 的插件重载，`main.py` 会重新加载，但 `douyin.*` 子模块沿用 `sys.modules` 里的旧对象。改子模块 → 重启核心。判断方法：日志文案与源码不一致，就是旧对象还在跑。
+
+### 29.5 验收
+
+- rect `(80, 60, 1280, 882)`、`vis=True`、`iconic=False`；
+- `私信守护：本轮读到 3 条私信内容，新 0 条`（0 新是因为已处理过）；
+- `私信守护：回了：「…」` 两条（修复前就已回成功，说明登录与写入都正常）。
