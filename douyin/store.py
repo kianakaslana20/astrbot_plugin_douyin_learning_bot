@@ -74,6 +74,20 @@ CREATE TABLE IF NOT EXISTS inbox (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_key ON inbox(kind, key);
 CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(handled_at, seen_at DESC);
+
+-- 私信发件箱：主动发出去的每一条都要留档。
+-- 为什么单独一张表而不是塞进 event：这条记录要能被 /dy confirm 捞出来、被重试、
+-- 被事后追查「到底发没发出去」，event 是流水，不适合当状态机。
+CREATE TABLE IF NOT EXISTS dm_outbox (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_uid TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending / sent / failed / skipped
+    created_at REAL NOT NULL,
+    sent_at    REAL,
+    error      TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_dm_out_status ON dm_outbox(status, created_at);
 """
 
 # status: new → picked → downloaded → analyzed / failed / skipped
@@ -151,6 +165,51 @@ class Store:
 
     async def inbox_stats(self) -> dict:
         return await asyncio.to_thread(self._inbox_stats_sync)
+
+    # ------------------------------------------------------------ 私信发件箱
+
+    def _dm_queue_sync(self, target_uid: str, text: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO dm_outbox(target_uid, text, status, created_at) VALUES(?,?,?,?)",
+                (target_uid, text, "pending", time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    async def dm_queue(self, target_uid: str, text: str) -> int:
+        """进待发队列，返回这条的 id。"""
+        return await asyncio.to_thread(self._dm_queue_sync, target_uid, text)
+
+    def _dm_pending_sync(self, limit: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM dm_outbox WHERE status='pending' ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def dm_pending(self, limit: int = 20) -> list[dict]:
+        return await asyncio.to_thread(self._dm_pending_sync, limit)
+
+    def _dm_mark_sync(self, row_id: int, status: str, error: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE dm_outbox SET status=?, error=?, sent_at=? WHERE id=?",
+                (status, error[:300], time.time() if status == "sent" else None, row_id),
+            )
+
+    async def dm_mark(self, row_id: int, status: str, error: str = "") -> None:
+        await asyncio.to_thread(self._dm_mark_sync, row_id, status, error)
+
+    def _dm_stats_sync(self) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) c FROM dm_outbox GROUP BY status"
+            ).fetchall()
+        return {r["status"]: int(r["c"]) for r in rows}
+
+    async def dm_stats(self) -> dict:
+        return await asyncio.to_thread(self._dm_stats_sync)
 
     # -------------------------------------------------------------- 保留期
 
