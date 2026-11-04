@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import random
 import re
 import subprocess
 import time
@@ -37,7 +38,9 @@ try:  # 正常情况：被 AstrBot 当作 data.plugins.<name>.main 加载
     )
     from .douyin.config import Settings, resolve_umo
     from .douyin.feed import parse_aweme
+    from .douyin.inbox import Entry, Inbox
     from .douyin.jobs import Job, JobQueue
+    from .douyin.limits import Limits
     from .douyin.pipeline import Pipeline, RoundResult
     from .douyin.social import ActionResult, Social
     from .douyin.store import Store
@@ -56,7 +59,9 @@ except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录
     )
     from douyin.config import Settings, resolve_umo  # type: ignore
     from douyin.feed import parse_aweme  # type: ignore
+    from douyin.inbox import Entry, Inbox  # type: ignore
     from douyin.jobs import Job, JobQueue  # type: ignore
+    from douyin.limits import Limits  # type: ignore
     from douyin.pipeline import Pipeline, RoundResult  # type: ignore
     from douyin.social import ActionResult, Social  # type: ignore
     from douyin.store import Store  # type: ignore
@@ -100,6 +105,8 @@ HELP_TEXT = """/dy            状态与用法
 /dy dom im|share|comment|both  抓对应面板的真实结构（登录后校准用）
 /dy kb [n]     看最近 n 条知识库
 /dy cookie     看抖音 cookie 状态（到期时间、保活）；/dy cookie import edge 从本机浏览器借登录态
+    "/dy inbox                翻私信和 @ 提醒，列出新到的视频（加「处理」才动手）",
+    "/dy dm 昵称 内容          用登录的号给某人发一条私信（走 dm_allow 白名单）",
 /dy update     检查 GitHub 上有没有新版本（apply 直接拉取）
 /dy stop       关掉浏览器，释放内存"""
 
@@ -137,6 +144,10 @@ SUB_ALIASES = {
     "配置": "cfg",
     "参数": "cfg",
     "白名单": "cfg",
+    "收件箱": "inbox",
+    "私信": "dm",
+    "提醒": "inbox",
+    "@": "inbox",
     "知识库": "kb",
     "停止": "stop",
     "关闭": "stop",
@@ -167,6 +178,7 @@ class DouyinLearningBot(Star):
 
         profile = Path(self.settings.profile_dir) if self.settings.profile_dir else self._profile_path()
         self.store = Store(self.data_dir / "dy.db")
+        self.limits = Limits(self.data_dir / "dy.db")
         self.browser = DouyinBrowser(self.settings, Path(profile))
         self.understander = Understander(self.context, self.settings, self.work_dir)
         self.pipeline = Pipeline(
@@ -175,7 +187,9 @@ class DouyinLearningBot(Star):
         dump_dir = (self.data_dir / "social_dumps") if self.settings.action_dump else None
         self.social = Social(self.browser, self.settings, dump_dir)
         self.voice = Voice(self.context, self.settings)
+        self.inbox = Inbox(self.browser, self.settings)
         self._pending: list[tuple] = []
+        self._pending_at: float = 0.0
 
         self._ready = False
         self._busy = asyncio.Lock()
@@ -231,6 +245,7 @@ class DouyinLearningBot(Star):
         dump_dir = (self.data_dir / "social_dumps") if self.settings.action_dump else None
         self.social = Social(self.browser, self.settings, dump_dir)
         self.voice = Voice(self.context, self.settings)
+        self.inbox = Inbox(self.browser, self.settings)
         self._login_notice_at = 0.0
 
     async def _prompt_login_window(self, umo: str, name: str, seconds: int = 90) -> bool:
@@ -293,6 +308,7 @@ class DouyinLearningBot(Star):
         self.understander.settings = self.settings
         self.pipeline.settings = self.settings
         self.social.settings = self.settings
+        self.inbox.settings = self.settings
         self.social.dump_dir = (
             (self.data_dir / "social_dumps") if self.settings.action_dump else None
         )
@@ -540,6 +556,15 @@ class DouyinLearningBot(Star):
         """
         if getattr(self, "_migrate_tried", False):
             return
+        if getattr(self.settings, "profile_pin", False):
+            # profile_pin：目录钉死，绝不动。自动迁移会换目录，
+            # 换目录在抖音眼里等于换了台设备，登录态和风控画像都得重来。
+            if not getattr(self, "_pin_logged", False):
+                self._pin_logged = True
+                logger.info(
+                    "profile_pin 开着，跳过自动迁移（当前目录：%s）", self._profile_path()
+                )
+            return
         plan = self._migration_plan()
         if not plan:
             return
@@ -714,6 +739,11 @@ class DouyinLearningBot(Star):
         if not self.settings.enabled:
             job.error = "插件总开关是关的（配置里 enabled=false）"
             return None
+        # 顺手清一次过期的记录和临时文件（keep_days 说了算，失败不影响这一轮）
+        try:
+            await self._retire()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保留期清理失败（不影响这一轮）：%s", exc)
         try:
             await self._migrate_kernel_profile()
             if not await self._ensure_login(job):
@@ -781,6 +811,141 @@ class DouyinLearningBot(Star):
             await self._notify_text(job.umo, f"这轮没成：{job.error}")
 
     # ------------------------------------------------------------- 写操作（分享/评论）
+
+    # ---------------------------------------------------------- 收件箱（私信/提醒）
+
+    async def _inbox_scan(self, umo: str = "") -> list[Entry]:
+        """翻一遍私信与提醒，把没见过的条目落进 inbox 表，返回新的那些。"""
+        page = await self.browser.page()
+        entries = await self.inbox.collect(
+            page,
+            include_dm=bool(getattr(self.settings, "inbox_dm", True)),
+            include_mentions=bool(getattr(self.settings, "inbox_mentions", True)),
+            max_conversations=int(getattr(self.settings, "inbox_max_conversations", 8) or 8),
+            max_cards=int(getattr(self.settings, "inbox_max_cards", 3) or 3),
+        )
+        fresh: list[Entry] = []
+        for e in entries:
+            is_new = await self.store.inbox_add(
+                e.kind,
+                e.key,
+                src=e.src,
+                payload=json.dumps(
+                    {"aweme_id": e.aweme_id, "who": e.who, "text": e.text, "when": e.when},
+                    ensure_ascii=False,
+                ),
+            )
+            if is_new:
+                fresh.append(e)
+        if fresh:
+            await self.store.log("inbox", f"新 {len(fresh)} 条（{umo}）")
+        return fresh
+
+    async def _pending_entries(self, limit: int = 20) -> list[Entry]:
+        """库里攒着还没处理的（含以前扫描到但没动手的）。"""
+        rows = await self.store.inbox_pending(limit=limit)
+        out: list[Entry] = []
+        for row in rows:
+            payload = {}
+            try:
+                payload = json.loads(row.get("payload") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            out.append(
+                Entry(
+                    kind=row.get("kind", ""),
+                    key=row.get("key", ""),
+                    aweme_id=str(payload.get("aweme_id") or ""),
+                    who=str(payload.get("who") or ""),
+                    text=str(payload.get("text") or ""),
+                    when=str(payload.get("when") or ""),
+                    src=row.get("src", ""),
+                )
+            )
+        return out
+
+    async def _inbox_handle(self, entries: list[Entry], umo: str) -> list[str]:
+        """一条条处理：私信视频写人味总结，@ 提醒看完了回一句。"""
+        page = await self.browser.page()
+        report: list[str] = []
+        for e in entries:
+            try:
+                if e.kind == "dm_share":
+                    line = await self._handle_dm_share(page, e, umo)
+                else:
+                    line = await self._handle_mention(page, e, umo)
+            except HumanVerifyNeeded as exc:
+                report.append(f"　{e.key}：撞上人机验证（{exc}），先停")
+                break
+            except Exception as exc:  # noqa: BLE001
+                line = f"没成：{type(exc).__name__}: {exc}"
+            report.append(f"· {e.who or e.kind}｜{line}")
+            await self.store.inbox_done(e.kind, e.key, line[:200])
+        return report
+
+    async def _handle_dm_share(self, page, entry: Entry, umo: str) -> str:
+        if not entry.aweme_id:
+            return "只有分享卡片、拿不到视频 id，先跳过"
+        item = await self.inbox.fetch_item(page, entry.aweme_id)
+        if item is None:
+            return "这条视频取不到详情（可能已下架）"
+        analysis = await self.pipeline._handle_one(item, 0.0, umo)
+        if analysis is None:
+            return "看不懂这条（转写和画面都没读出来），没敢乱写"
+        note = ""
+        if getattr(self.settings, "inbox_share_summary", True):
+            note = await self.voice.summary(
+                title=item.desc or item.title,
+                author=item.author,
+                analysis_summary=analysis.summary,
+                keywords=analysis.keywords,
+                transcript=analysis.transcript,
+                frames=[str(analysis.montage)] if analysis.montage else None,
+                umo=umo,
+            )
+        body = note or analysis.summary or ""
+        head = f"{entry.who or '有人'} 发来的：{item.title[:30] or entry.aweme_id}"
+        tail = f"\n　　https://www.douyin.com/video/{entry.aweme_id}"
+        text = f"{head}\n{body}{tail}" if body else head + tail
+        await self._notify_text(umo or self._last_umo, text)
+        return "看完了，总结发你了" if note else "看完了（模型没给总结，附了原始摘要）"
+
+    async def _handle_mention(self, page, entry: Entry, umo: str) -> str:
+        if not entry.aweme_id:
+            return "这条提醒拿不到视频 id，你可能得自己点开看"
+        item = await self.inbox.fetch_item(page, entry.aweme_id)
+        if item is None:
+            return "这条视频取不到详情（可能已下架）"
+        analysis = await self.pipeline._handle_one(item, 0.0, umo)
+        if not getattr(self.settings, "inbox_mention_reply", True):
+            return "看过了（回复开关是关的，没回）"
+        why = await self.limits.check_async("comment", self.settings)
+        if why:
+            return f"看过了，但先不回：{why}"
+        text = ""
+        if analysis is not None:
+            text = await self.voice.reply(
+                their=entry.text or "",
+                title=item.desc or item.title,
+                analysis_summary=analysis.summary,
+                frames=[str(analysis.montage)] if analysis.montage else None,
+                umo=umo,
+            )
+        if not text:
+            return "看过了，但没想出怎么说（模型没给合格的一句），没回"
+        res = await self.social.comment(entry.aweme_id, text, [entry.who] if entry.who else [])
+        if not res.ok:
+            return f"回的时候失败：{res.detail}"
+        await self.limits.hit_async("comment")
+        return f"回了：{text}"
+
+    async def send_dm(self, who: str, text: str) -> bool:
+        """按昵称找人发一条私信（走界面）。"""
+        page = await self.browser.page()
+        dm = self.inbox.dm
+        if not await dm.open_conversation(page, who):
+            return False
+        return await dm.send_text(page, text)
 
     async def _pick_item(self, aweme_id: str = "") -> _ItemRef | None:
         """优先用指定 aweme_id，否则取知识库里最近一条已分析的视频。"""
@@ -870,43 +1035,110 @@ class DouyinLearningBot(Star):
             text = item.share_url
         return text.strip()[:300]
 
+    async def _human_pause(self) -> None:
+        """动作之间歇一会儿，且时间不固定。
+
+        固定间隔本身就是指纹：每 6.0 秒一次，连着十次，比任何行为都像脚本。
+        所以取 action_delay_s 的 0.6~1.8 倍随机，偶尔再长一点（看手机的停顿）。
+        """
+        base = max(0.0, float(self.settings.action_delay_s or 0))
+        if base <= 0:
+            return
+        if not getattr(self.settings, "action_jitter", True):
+            await asyncio.sleep(base)
+            return
+        delay = random.uniform(base * 0.6, base * 1.8)
+        if random.random() < 0.15:  # 偶尔走神更久
+            delay *= random.uniform(1.6, 2.4)
+        await asyncio.sleep(delay)
+
+    async def _retire(self) -> None:
+        """按 keep_days 清旧数据：库里的行 + work/media 里的视频帧图。"""
+        days = int(getattr(self.settings, "keep_days", 30) or 0)
+        if days <= 0:
+            return
+        try:
+            stats = await self.store.prune(days)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("清旧记录失败：%s", exc)
+            return
+        try:
+            await asyncio.to_thread(self.limits.prune, days * 86400)
+        except Exception:  # noqa: BLE001
+            pass
+        cutoff = time.time() - days * 86400
+        removed = 0
+        for path in sorted(self.work_dir.glob("*")):
+            try:
+                if path.is_file() and path.suffix.lower() not in {".json", ".db"} and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        total = sum(stats.values())
+        if total or removed:
+            logger.info("清理保留期外的记录：%s，文件 %d 个", stats, removed)
+
     async def _do_actions(self, pairs: list[tuple]) -> list[str]:
         """对已分析的视频执行分享 + 评论，返回给人看的回执行。"""
         lines: list[str] = []
+        if getattr(self.settings, "rate_enabled", True) and self.limits.in_quiet_hours(
+            getattr(self.settings, "quiet_hours", "") or ""
+        ):
+            return [f"　静默时段（{self.settings.quiet_hours}），这轮不动手"]
         budget = max(0, self.settings.max_actions_per_round)
         for item, analysis in pairs[:budget]:
             # 点赞（最低风险的那一档，先做）
             if self.settings.auto_like and not await self.store.acted(
                 item.aweme_id, "like", "digg"
             ):
-                res = await self.social.like(item.aweme_id, True)
-                await self.store.record_action(item.aweme_id, "like", "digg", res.ok, res.detail)
-                lines.append(f"　{res}")
-                await asyncio.sleep(self.settings.action_delay_s)
+                why = await self.limits.check_async("like", self.settings)
+                if why:
+                    lines.append(f"　跳过点赞：{why}")
+                else:
+                    res = await self.social.like(item.aweme_id, True)
+                    await self.store.record_action(
+                        item.aweme_id, "like", "digg", res.ok, res.detail
+                    )
+                    if res.ok:
+                        await self.limits.hit_async("like")
+                    lines.append(f"　{res}")
+                    await self._human_pause()
             # 分享
             wanted, _rejected = self.settings.check_targets(
                 list(self.settings.share_allowlist), kind="share"
             )
             todo = [t for t in wanted if not await self.store.acted(item.aweme_id, "share", t)]
+            why_share = await self.limits.check_async("share", self.settings) if todo else ""
+            if todo and why_share:
+                lines.append(f"　跳过分享：{why_share}")
+                todo = []
             if todo:
                 results = await self.social.share(item.aweme_id, todo, self._share_text(item))
                 for res in results:
                     await self.store.record_action(
                         item.aweme_id, "share", res.target, res.ok, res.detail
                     )
+                    if res.ok:
+                        await self.limits.hit_async("share")
                     lines.append(f"　{res}")
-                await asyncio.sleep(self.settings.action_delay_s)
+                await self._human_pause()
             # 评论
             text = await self._comment_text(item, analysis)
             mentions, _blocked = self.settings.check_targets(
                 list(self.settings.mention_allowlist), kind="mention"
             )
             key = "@".join(mentions) or "评论"
-            if text and not await self.store.acted(item.aweme_id, "comment", key):
+            why_comment = await self.limits.check_async("comment", self.settings)
+            if text and why_comment:
+                lines.append(f"　跳过评论：{why_comment}")
+            elif text and not await self.store.acted(item.aweme_id, "comment", key):
                 res = await self.social.comment(item.aweme_id, text, mentions)
                 await self.store.record_action(item.aweme_id, "comment", key, res.ok, res.detail)
+                if res.ok:
+                    await self.limits.hit_async("comment")
                 lines.append(f"　{res}")
-                await asyncio.sleep(self.settings.action_delay_s)
+                await self._human_pause()
         return lines
 
     async def _auto_actions(self, result: RoundResult) -> str:
@@ -916,6 +1148,7 @@ class DouyinLearningBot(Star):
             return ""
         if mode == "ask":
             self._pending = result.analyzed[: max(1, self.settings.max_actions_per_round)]
+            self._pending_at = time.time()
             return "\n\n这条要分享/评论吗？回 /dy do 执行，或 /dy do 跳过"
         try:
             lines = await self._do_actions(result.analyzed)
@@ -1405,6 +1638,12 @@ class DouyinLearningBot(Star):
                 + (f"｜禁词 {st.voice_banned}" if st.voice_banned else ""),
                 f"  分享文案：{st.share_text or '（默认：只发链接）'}",
                 f"  每轮上限：{st.max_actions_per_round} 条｜动作间隔：{st.action_delay_s}s",
+                f"  频率：{self.limits.summary(st) if st.rate_enabled else '关（不限）'}"
+                + (f"｜静默 {st.quiet_hours}" if st.quiet_hours else ""),
+                f"  待执行动作过期：{st.pending_ttl_hours} 小时",
+                f"  内核：{st.channel or 'chromium'}"
+                + ("（严格：起不来就报错）" if st.channel_strict else "（起不来会退回 chromium）")
+                + ("｜profile 钉死" if st.profile_pin else ""),
                 f"  选片：时长 {st.min_duration_s}-{st.max_duration_s}s｜最低点赞 {st.min_like}"
                 f"｜每轮 {st.want} 条｜{st.frames} 帧拼图",
                 f"  理解：ASR {st.asr_backend}｜单条下载上限 {st.max_download_mb}MB",
@@ -1535,11 +1774,17 @@ class DouyinLearningBot(Star):
                         text = ""
                 if not text:
                     text = self._template_comment(item, summary)
+            why = await self.limits.check_async("comment", self.settings)
+            if why:
+                yield event.plain_result(f"没发：{why}")
+                return
             yield event.plain_result(
                 f"正在评论「{item.title[:24] or item.aweme_id}」：{text[:40]}"
                 f"{'　@' + ' @'.join(mentions) if mentions else ''}…"
             )
             res = await self.social.comment(item.aweme_id, text, mentions)
+            if res.ok:
+                await self.limits.hit_async("comment")
             await self.store.record_action(
                 item.aweme_id, "comment", "@".join(mentions) or "评论", res.ok, res.detail
             )
@@ -1565,7 +1810,17 @@ class DouyinLearningBot(Star):
                 )
                 return
             pairs = self._pending
+            ttl_h = int(getattr(self.settings, "pending_ttl_hours", 12) or 0)
+            if ttl_h and self._pending_at and time.time() - self._pending_at > ttl_h * 3600:
+                age_h = (time.time() - self._pending_at) / 3600
+                self._pending = []
+                yield event.plain_result(
+                    f"这些动作已经放了 {age_h:.0f} 小时（超过 {ttl_h} 小时），作废了。"
+                    "重新 /dy start 刷一轮再确认吧——放着不动的分享/评论，执行时视频可能都凉了"
+                )
+                return
             self._pending = []
+            self._pending_at = 0.0
             yield event.plain_result(f"开始执行 {len(pairs)} 条视频的分享/评论…")
             lines = await self._do_actions(pairs)
             yield event.plain_result("\n".join(lines) or "没有需要执行的（这些视频可能都做过了）")
@@ -1594,6 +1849,57 @@ class DouyinLearningBot(Star):
             )
             report = await self.social.probe(item.aweme_id, kind)
             yield event.plain_result(report[-1500:] if len(report) > 1500 else report)
+            return
+
+        if sub in {"inbox", "dms", "mentions"}:
+            await self._ensure_ready()
+            do = any(a in {"处理", "handle", "run", "do", "yes"} for a in args[1:])
+            yield event.plain_result("去翻一遍私信和提醒，大概 30 秒…")
+            try:
+                entries = await self._inbox_scan(event.unified_msg_origin)
+            except HumanVerifyNeeded as exc:
+                yield event.plain_result(f"翻的时候撞上人机验证（{exc}），发 /dy verify 我把它挪到桌面上。")
+                return
+            pending = await self._pending_entries() if do else []
+            if not entries and not pending:
+                yield event.plain_result("没有新的：私信里没人发视频过来，提醒里也没有新的 @。")
+                return
+            if entries:
+                lines = [f"新收 {len(entries)} 条："]
+                for idx, e in enumerate(entries, 1):
+                    lines.append(f"{idx}. {e.describe()}")
+                yield event.plain_result("\n".join(lines))
+            if not do:
+                if entries:
+                    yield event.plain_result("要我现在就一条条看、写总结/回评论，发 /dy inbox 处理")
+                else:
+                    yield event.plain_result(f"手里还压着 {len(pending)} 条没处理，发 /dy inbox 处理")
+                return
+            todo = pending or entries
+            report = await self._inbox_handle(todo, event.unified_msg_origin)
+            yield event.plain_result("\n".join(report) if report else "处理完了，没什么可说的。")
+            return
+
+        if sub in {"dm", "message", "发私信"}:
+            await self._ensure_ready()
+            if len(args) < 3:
+                yield event.plain_result("用法：/dy dm 昵称 要说的话")
+                return
+            who, text = args[1], " ".join(args[2:])
+            allow = [x.strip() for x in (self.settings.dm_allow or "").split(",") if x.strip()]
+            if allow and not any(a == who or a in who or who in a for a in allow):
+                yield event.plain_result(f"「{who}」不在私信白名单里（面板 actions.dm_allow）")
+                return
+            why = await self.limits.check_async("dm", self.settings)
+            if why:
+                yield event.plain_result(f"先不发：{why}")
+                return
+            ok = await self.send_dm(who, text)
+            if ok:
+                await self.limits.hit_async("dm")
+                yield event.plain_result(f"发给「{who}」了：{text}")
+            else:
+                yield event.plain_result(f"没发出去（会话「{who}」打不开，或输入框没出来）")
             return
 
         if sub in {"kb", "list"}:
