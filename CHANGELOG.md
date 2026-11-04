@@ -2,6 +2,27 @@
 
 版本号规则：`主.次.修订`。次版本号进位 = 有新能力或有不兼容的配置变化，修订号 = 修 bug / 调参数。
 
+## 0.8.5 — 2026-11-04
+
+**评论不再套模板：交给对话模型 + AstrBot 人格写**
+
+- 新增 `douyin/voice.py`（`Voice`）：取 `context.persona_manager` 的人格 prompt，
+  用 `context.get_using_provider(umo)` 那个对话模型，把**标题/作者/摘要/关键词/听写**
+  连同 4 格抽帧拼图一起送过去，要一句人话
+- 生成后自检：AI 腔黑名单（首先/其次/综上/这个视频/干货满满…）、多行、列表、空
+  → 命中带「重写一句更像人话的」再来一次；两次都不行退回模板（宁可平淡，不要 AI 腔）
+- 剥掉模型自己加的 `@某某` 和引号（@ 由发评论那层加，避免 @ 到错的人）
+- 新增配置 6 项：`voice_enabled`（默认开）、`voice_persona`（人格名，空=会话默认）、
+  `voice_max_chars`（40）、`voice_frames`（1=送拼图，0=只看文字）、
+  `voice_timeout_s`（60）、`voice_banned`（额外禁词）
+- `/dy comment` 不带正文时也走模型（原来是把摘要塞进模板）；
+  `/dy cfg` 里显示「评论文案：模型按人格写 / 模板」与人格名
+- 单测 `_test_dy_voice.py` 17 项全过；顺手补齐 `_test_dy_bg.py` 的桩
+  （`show_window` / `keepalive` / `session_info` / `raw_cookies`，v0.8.2 之后漏的）
+
+实测：人格确实进了 system prompt（`[大肥鱼]` / 大肥鱼那段鲸鱼娘设定），
+图片以 `file:///` 送进 `image_urls` 并被 `resolve_image_ref_to_base64_data` 解成 data URL。
+
 ## 0.8.4 — 2026-11-04
 
 **评论发得出去、@ 是空的：`text_extra.user_id` 塞了抖音号**
