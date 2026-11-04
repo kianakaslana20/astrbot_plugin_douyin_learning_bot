@@ -248,6 +248,11 @@ class Settings:
     dm_chat_enabled: bool = False
     dm_chat_allow: str = ""
     dm_chat_max: int = 2
+    dm_chat_no_limit: str = "",  # 这些人私聊不限次数（逗号分隔）
+    dm_chat_poll_s: int = 0,    # >0：每隔这么多秒盯一次私信（0=跟着主循环）
+    dm_chat_history: int = 6,   # 带几句上下文
+    dm_identity: str = ""
+    dm_self_names: str = ""    # 自聊会话（自己跟自己）：这些会话里靠"我说过什么"来分辨谁在说,     # 抖音昵称=QQ号，一行一条
     voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
     voice_persona: str = ""        # 人格名；留空 = 用该会话的默认人格
     voice_max_chars: int = 40      # 一条评论多少字以内
@@ -366,6 +371,11 @@ class Settings:
         dm_chat_enabled=_as_bool(ibx.get("dm_chat_enabled"), False),
         dm_chat_allow=_as_str(ibx.get("dm_chat_allow"), ""),
         dm_chat_max=_as_int(ibx.get("dm_chat_max"), 2, 0, 10),
+        dm_chat_no_limit=_as_str(ibx.get("dm_chat_no_limit"), ""),
+        dm_chat_poll_s=_as_int(ibx.get("dm_chat_poll_s"), 0, 0, 3600),
+        dm_chat_history=_as_int(ibx.get("dm_chat_history"), 6, 0, 20),
+        dm_identity=_as_str(ibx.get("dm_identity"), ""),
+        dm_self_names=_as_str(ibx.get("dm_self_names"), ""),
         voice_enabled=_as_bool(ac.get("voice_enabled"), True),
             voice_persona=_as_str(ac.get("voice_persona"), ""),
             voice_max_chars=_as_int(ac.get("voice_max_chars"), 40, 6, 200),
