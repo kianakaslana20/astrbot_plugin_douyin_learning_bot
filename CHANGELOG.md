@@ -298,6 +298,25 @@
 - 私信白名单 `dm_allow` 与分享/@ 白名单分开：分享错人只是尴尬，私信发错人是骚扰。
 
 
+## 0.9.7 — 2026-11-04
+
+**能主动发私信了。**
+
+- 新增 `im.py: send_dm / resolve_target / send_text / sent_ok / editor_text / panel_text`，
+  `social.send_dm` 做门面；走界面，不走接口（imsdk 在 WebSocket 里，拼不出纯 HTTP）。
+- 新增 `dm_outbox` 表（`target_uid / text / status / created_at / sent_at / error`），
+  与 `inbox` 分开：一个是「别人发来的」，一个是「我要发出去的」。
+- 配额独立核算：`rate_dm_out_per_hour=3`、`rate_dm_out_per_day=20`；
+  `dm_quota_separate=false` 时并回日常回话那一池。
+- `action_mode` 三态接入：off 不发 / ask 进发件箱等 `/dy confirm` / auto 直接发。
+- 三个实测坑：
+  1. `[data-e2e="msg-input"]` 只是外壳，真正能打字的是里面的 `div.editor-kit-container`；
+  2. 会话行 `innerText` **没有换行**（`昵称10:37预览`），名字要从 title 元素取再把时间削掉；
+     会话行上也没有 `data-userid`（那只在分享面板里），纯数字 uid 先用缓存换昵称；
+  3. 回读不能用「最后一条消息节点」——分享卡会盖在最后，读到的是卡片作者名；
+     改成「输入框已清空 + 抽屉里出现这句话」。
+- 回读策略修正：先等 6 秒看渲染，确认没发才补一次，避免重发导致两条一样。
+
 ## 0.9.6
 
 ### 修：窗口看不见 / 私信收不到 / 登录老掉（同一个根）
