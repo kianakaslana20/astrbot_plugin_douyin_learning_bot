@@ -613,3 +613,76 @@ MIT，见 [LICENSE](LICENSE)。
 
 发件箱落在 `dy.db` 的 `dm_outbox`（`target_uid / text / status / created_at / sent_at / error`），
 `/dy dm 状态` 可以看排队与成败。失败会私聊告诉你，不会静默。
+
+## 四点零四、从「定时轮询」改成「事件触发 + 模型自己判断」（v0.10.0）
+
+以前所有东西都靠定时器：私信每 60 秒扫一次，刷视频每 90 分钟一轮。能跑，但两条硬伤——
+消息来了要等最多一分钟，刷不刷由时间决定而不是由「有没有值得看的」决定。
+
+### 一、先看抖音自己推不推
+
+挂 `page.on("websocket")` 看了 60 秒，页面上 5 条长连接：
+
+| 连接 | 空闲期帧 | 用途 |
+|---|---|---|
+| `wss://frontier-im.douyin.com/ws/v2` | 3~4 帧，**全是文本 `hi` 心跳** | **私信主通道** |
+| `wss://frontier-pc.douyin.com/ws/v2` | 2 帧 `hi` | PC 端另一路 |
+| `wss://bytelink100-ws.douyin.com/...` | 12 帧二进制 | 埋点上报，跟私信无关 |
+
+结论：**推送是真的，但业务帧是 protobuf**。所以不解析——把「frontier 上出现非 `hi`、长度≥32 的帧」当成
+**有动静的信号**，信号一到立刻走一次界面读取。比纯轮询快，比解 protobuf 稳。
+
+### 二、四层结构
+
+| 层 | 做什么 | 代码 |
+|---|---|---|
+| 信号 | 监听 WS，心跳过滤，置脏标记 | `douyin/im.py::ImWatcher` |
+| 判断 | 该不该回、回什么、这轮值不值得刷 | `douyin/agent.py::DouyinAgent` |
+| 执行 | 发私信（回读校验）、发评论、刷一轮 | `social.send_dm` / `jobs.submit` |
+| 兜底 | WS 静默 5 分钟就退回 10 分钟一次轮询 | `_wait_signal` 超时 |
+
+日志每轮都标来源，能一眼看出是推的还是兜的：
+
+```
+私信守护(ws)：读到 3 条，新 1 条，回了 1 条，跳过 0 条
+私信守护(poll)：读到 3 条，新 0 条，回了 0 条，跳过 0 条
+```
+
+### 三、模型判断，不是规则直出
+
+`DouyinAgent.handle_douyin_event` 把「事件类型／对方昵称／是否自己人／本次内容／最近 12 条历史」拼成一段，
+交给你在 AstrBot 里配的那个对话模型（复用主核心 provider，不另配 key），人设取当前人格，
+只要一个 JSON：
+
+```json
+{"reply": true, "text": "在的在的，怎么了", "reason": "自己人打招呼"}
+```
+
+`reply:false` 就什么都不发，只记 `dm_judge` 表。没有可用模型时**退回原来的规则路径**，不会哑掉。
+
+自主刷同理：`judge_round` 返回 `{"run":true,"take":3,"reason":"有人分享"}` 才排一轮，
+刷前先问，刷后简报标「自主判断触发」，跟手动 `/dy start` 分得开。
+
+### 四、白名单与限流怎么相处
+
+- `dm_targets` 里的人（自己人）：**不计数、不限流**，但**静默时段照样生效**。
+- 其他会话：走 `rate_dm_per_hour` / `rate_dm_per_day`。
+- 评论区一次只针对一个人回一条：同一 uid 还没回完，新事件直接丢。
+- 自主刷另有两道上限：`auto_rounds_per_day`、`auto_items_per_day`。
+
+### 五、配置（面板「私信与提醒」组）
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `agent_enabled` | 开 | 事件交给模型判断；关了退回规则直出 |
+| `event_ws` | 开 | 用 WS 帧当触发信号 |
+| `poll_fallback_min` | 10 | WS 静默时的兜底间隔（分钟） |
+| `autonomous_round` | 开 | 不用 `/dy start` 也能自己刷 |
+| `auto_rounds_per_day` | 4 | 自主刷每天最多几轮 |
+| `auto_items_per_day` | 8 | 自主刷每天最多看几条 |
+
+### 六、改完必须重启核心
+
+`/dy reload` 只重载 `main.py`，`douyin/*` 子模块还是旧对象。这次动了 `im.py`、新增了 `agent.py`，
+所以只能重启 AstrBot 核心才生效。
+
