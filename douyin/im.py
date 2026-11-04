@@ -45,84 +45,249 @@ def _strip_when(text: str) -> str:
     return name
 
 class ImWatcher:
-    """监听抖音 IM 的 WebSocket 帧，只当「有动静」的信号用。
+    """Push receiver. Known schemas yield events; unknown business frames request DOM enrichment.
 
-    实测：`wss://frontier-im.douyin.com/ws/v2` 平时每十几秒发一帧文本 `hi`
-    （心跳）；真有人发消息时会有二进制帧（protobuf，不解析）。所以这里只做两件事：
-    认出「不是心跳的帧」→ 置脏标记；记录最后一次收到信号的时间。
-    脏标记触发一次界面读取（比解析 protobuf 稳，也比纯轮询快）。
+    Attach before navigation. CDP also observes sockets already open when attaching.
+    No frame-length heuristic: only explicit heartbeat values are ignored.
     """
 
-    HEARTBEATS = (b"hi", b"", "hi", "")
+    HEARTBEATS = (b"hi", b"", "hi", "", b"ping", b"pong", "ping", "pong")
 
     def __init__(self, page):
+        import asyncio
+        from collections import deque
         self.page = page
-        self.frames = 0
-        self.signals = 0
-        self.last_signal = 0.0
-        self.last_heartbeat = 0.0
+        self.frames = self.signals = 0
+        self.last_signal = self.last_heartbeat = 0.0
+        self.created_at = time.monotonic()
+        self.last_rx = 0.0
+        self.disconnected_at = self.created_at
         self.dirty = False
-        self.urls: list[str] = []
+        self.urls = []
         self.last_frame = ""
-        try:
-            page.on("websocket", self._on_ws)
-        except Exception:  # noqa: BLE001
-            pass
+        self.events = deque(maxlen=256)
+        self.diagnostics = deque(maxlen=12)
+        self.wake = asyncio.Event()
+        self.routes = set()
+        self._seen = {}
+        self._frame_seen = {}
+        self._comment_users = set()
+        self._sockets = set()
+        self._cdp = None
+        self._cdp_urls = {}
+        self._closed = False
+        self.dropped = 0
+        page.on("websocket", self._on_ws)
 
-    # ---------------------------------------------------------------- 内部
-    def _on_ws(self, ws) -> None:
-        url = getattr(ws, "url", "") or ""
-        if "frontier-im" not in url and "frontier-pc" not in url:
+    async def start(self):
+        if self._cdp is not None:
             return
-        self.urls.append(url[:80])
         try:
-            ws.on("framereceived", self._on_frame)
-        except Exception:  # noqa: BLE001
-            pass
+            self._cdp = await self.page.context.new_cdp_session(self.page)
+            self._cdp.on("Network.webSocketCreated", self._cdp_created)
+            self._cdp.on("Network.webSocketFrameReceived", self._cdp_frame)
+            self._cdp.on("Network.webSocketClosed", self._cdp_closed)
+            await self._cdp.send("Network.enable")
+        except Exception as exc:
+            self.diagnostics.append("cdp:" + type(exc).__name__)
 
-    def _on_frame(self, payload) -> None:
+    @staticmethod
+    def _route(url):
+        from urllib.parse import urlsplit
+        host = urlsplit(url).hostname or ""
+        if host == "frontier-im.douyin.com":
+            return "im"
+        if host == "frontier-pc.douyin.com":
+            return "notice"
+        return ""
+
+    def _cdp_created(self, event):
+        key = event.get("requestId", "")
+        route = self._route(event.get("url", ""))
+        self._cdp_urls[key] = route
+        if route:
+            self._sockets.add(key)
+            self._log_once(route)
+
+    def _cdp_frame(self, event):
+        import base64
+        key = event.get("requestId", "")
+        # A pre-existing socket has no created event after Network.enable.
+        route = self._cdp_urls.get(key, "unknown")
+        if not route:
+            return
+        response = event.get("response") or {}
+        payload = response.get("payloadData", "")
+        if response.get("opcode") == 2:
+            try:
+                payload = base64.b64decode(payload, validate=True)
+            except Exception:
+                return
+        self._sockets.add(key)
+        self._on_frame(payload, route)
+
+    def _cdp_closed(self, event):
+        self._closed_socket(event.get("requestId", ""))
+
+    def _closed_socket(self, key):
+        self._sockets.discard(key)
+        if not self._sockets:
+            self.disconnected_at = time.monotonic()
+
+    def _log_once(self, route: str) -> None:
+        """第一次接上某类连接时打一行 —— 日志里要能看出「WS 到底有没有连上」。"""
+        seen = getattr(self, "_logged_routes", None)
+        if seen is None:
+            seen = self._logged_routes = set()
+        if route in seen:
+            return
+        seen.add(route)
+        name = {"im": "私信通道(frontier-im)", "notice": "平台互动(frontier-pc)"}.get(route, route)
+        logger.info("事件守护：接上 %s 的 WebSocket，后面按帧解码", name)
+
+    def _on_ws(self, ws):
+        route = self._route(getattr(ws, "url", "") or "")
+        if not route:
+            return
+        # Store only host/route, never query-string tokens.
+        self.urls.append(route)
+        self.urls[:] = self.urls[-20:]
+        key = id(ws)
+        self._sockets.add(key)
+        self._log_once(route)
+        ws.on("framereceived", lambda payload: self._on_frame(payload, route))
+        ws.on("close", lambda *args: self._closed_socket(key))
+        ws.on("socketerror", lambda *args: self._closed_socket(key))
+
+    def _on_frame(self, payload, route="unknown"):
+        if self._closed:
+            return
         self.frames += 1
-        now = time.time()
+        if route != "unknown":
+            self.last_rx = time.monotonic()
+            self.disconnected_at = 0.0
         if payload in self.HEARTBEATS:
-            self.last_heartbeat = now
+            self.last_heartbeat = time.time()
             return
-        size = len(payload) if hasattr(payload, "__len__") else 0
-        if isinstance(payload, str) and len(payload) < 12:
-            self.last_heartbeat = now
+        from .wsproto import decode_frame
+        result = decode_frame(payload)
+        if not result.dirty and not result.events:
             return
-        if size and size < 32:
-            # 短帧多半还是控制帧
-            self.last_heartbeat = now
-            return
+        if route == "unknown" and not result.events:
+            return  # existing unrelated telemetry sockets are not notification signals
+        now = time.monotonic()
+        fingerprint = result.raw_frame_id
+        if fingerprint and now - self._frame_seen.get(fingerprint, -100.0) < 2.0:
+            self.routes.add(route)
+            return  # Playwright and CDP observed the same frame
+        if fingerprint:
+            self._frame_seen[fingerprint] = now
+            if len(self._frame_seen) > 1024:
+                self._frame_seen.pop(next(iter(self._frame_seen)))
         self.signals += 1
-        self.last_signal = now
+        self.last_signal = time.time()
+        self.last_frame = result.raw_frame_id  # no message text in diagnostics
+        self.diagnostics.extend(result.diagnostics[-3:])
         self.dirty = True
-        try:
-            head = payload[:48] if isinstance(payload, (bytes, bytearray)) else str(payload)[:48]
-            self.last_frame = repr(head)
-        except Exception:  # noqa: BLE001
-            self.last_frame = ""
+        self.routes.add(route)
+        for evt in result.events:
+            extra = evt.setdefault("extra", {})
+            extra["transport_route"] = route
+            # IM comment cards and IM mentions are NOT public comment events.
+            if extra.get("channel") == "im" or route == "im":
+                extra["channel"] = "im"
+            self.enqueue(evt)
+        self.wake.set()
 
-    # ---------------------------------------------------------------- 对外
-    def take(self) -> bool:
-        """取走脏标记：这次是真有动静吗。"""
+    def enqueue(self, evt):
+        key = str(evt.get("event_id") or "")
+        if key and key in self._seen:
+            return False
+        extra = evt.get("extra") or {}
+        is_comment = evt.get("type") in {"comment", "mention"} and extra.get("channel") != "im"
+        uid = str(evt.get("from_uid") or "")
+        if is_comment and uid and uid in self._comment_users:
+            self.dropped += 1
+            return False
+        if len(self.events) >= self.events.maxlen:
+            self.dropped += 1
+            self.diagnostics.append("queue_full:DOM_resync")
+            self.dirty = True
+            return False
+        if key:
+            self._seen[key] = time.monotonic()
+            if len(self._seen) > 2048:
+                self._seen.pop(next(iter(self._seen)))
+        if is_comment and uid:
+            self._comment_users.add(uid)
+        self.events.append(evt)
+        self.wake.set()
+        return True
+
+    def release(self, evt):
+        # Only the public-comment events actually took the per-user slot in enqueue().
+        extra = evt.get("extra") or {}
+        if evt.get("type") in {"comment", "mention"} and extra.get("channel") != "im":
+            self._comment_users.discard(str(evt.get("from_uid") or ""))
+
+    def drain(self):
+        events = list(self.events)
+        self.events.clear()
+        routes, self.routes = self.routes, set()
+        self.dirty = False
+        self.wake.clear()
+        return events, routes
+
+    def peek(self):
+        """看队列里有什么但不清空 —— 首轮快照要用它避开「刚推过来的新消息」。"""
+        return list(self.events)
+
+    def restore(self, events):
+        """Put drained events back after the UI read failed, so no push is lost."""
+        back = [evt for evt in (events or []) if evt]
+        if not back:
+            return 0
+        for evt in reversed(back):
+            extra = evt.get("extra") or {}
+            if evt.get("type") in {"comment", "mention"} and extra.get("channel") != "im":
+                continue  # public comment lock was released; DOM will re-read it
+            if len(self.events) >= self.events.maxlen:
+                self.dirty = True
+                break
+            self.events.appendleft(evt)
+        self.wake.set()
+        return len(back)
+
+    def take(self):
         got, self.dirty = self.dirty, False
         return got
 
-    def alive(self, silent_s: float = 300.0) -> bool:
-        """WS 还活着吗（最近 silent_s 秒内收到过任何帧）。"""
-        last = max(self.last_heartbeat, self.last_signal, 0.0)
-        return last > 0 and (time.time() - last) < silent_s
+    def alive(self, silent_s=300.0):
+        return bool(self.last_rx and time.monotonic() - self.last_rx < silent_s and self._sockets)
 
-    def stats(self) -> dict:
-        return {
-            "frames": self.frames,
-            "signals": self.signals,
-            "age_s": round(time.time() - self.last_signal, 1) if self.last_signal else -1,
-            "alive": self.alive(),
-            "conns": len(self.urls),
-            "last_frame": self.last_frame,
-        }
+    def fallback_due(self, last_poll, interval=600):
+        now = time.monotonic()
+        lost = self.disconnected_at or (self.last_rx + 300 if self.last_rx else self.created_at)
+        return not self.alive() and now - lost >= 300 and now - last_poll >= interval
+
+    async def close(self):
+        self._closed = True
+        try:
+            self.page.remove_listener("websocket", self._on_ws)
+        except Exception:
+            pass
+        if self._cdp is not None:
+            try:
+                await self._cdp.detach()
+            except Exception:
+                pass
+        self.wake.set()
+
+    def stats(self):
+        return {"frames": self.frames, "signals": self.signals,
+                "alive": self.alive(), "conns": len(self._sockets),
+                "queued": len(self.events), "dropped": self.dropped,
+                "last_frame": self.last_frame, "diagnostics": list(self.diagnostics)}
 
 
 @dataclass
