@@ -207,6 +207,7 @@ class DouyinLearningBot(Star):
         self.inbox = Inbox(self.browser, self.settings)
         self.agent = DouyinAgent(self.voice, self.settings, self.store, self.memory)
         self.watcher = None
+        self._ws_dm_seen = []      # [(who, text, ts)] —— WS 已经认领的私信，DOM 那条要跳过
         self._watch_attach_lock = asyncio.Lock()
         self._comment_confirm_lock = asyncio.Lock()
         self.browser.on_page_ready = self._attach_event_page
@@ -1147,6 +1148,24 @@ class DouyinLearningBot(Star):
                 candidates[0].extra.update({"event_id": evt.get("event_id"),
                     "raw_frame_id": evt.get("raw_frame_id"), "from_uid": uid,
                     "timestamp": evt.get("timestamp"), "protocol": True})
+                if evt.get("type") == "dm" and evt.get("content"):
+                    self._ws_mark(who, str(evt["content"]).strip())
+                continue
+            # 界面没读到这条（面板没跟上、或者对方秒删）—— 协议层已经拿到了内容，
+            # 就别丢了：自己造一条条目走同一条处理链路（白名单/限流/静默照旧生效）。
+            # 界面里能对上（哪怕对上多条）就不另外造，避免同一条私信回两遍。
+            kind_map = {"dm": "dm_text", "share": "dm_share"}
+            kind = kind_map.get(str(evt.get("type")))
+            if not candidates and kind and who and str(evt.get("content") or "").strip():
+                entry = Entry(kind=kind, key=str(evt.get("event_id") or ""), src=who,
+                    who=who, text=str(evt["content"]).strip(), when="",
+                    aweme_id=str(evt.get("aweme_id") or ""),
+                    extra={"event_id": evt.get("event_id"), "raw_frame_id": evt.get("raw_frame_id"),
+                           "from_uid": uid, "timestamp": evt.get("timestamp"),
+                           "protocol": True, "source": "ws"})
+                entries.append(entry)
+                if kind == "dm_text":
+                    self._ws_mark(who, entry.text)
                 continue
             # Preserve structured evidence even when DOM/identity is not ready.
             await self.store.inbox_add("ws_evidence", str(evt.get("event_id") or evt.get("raw_frame_id")),
@@ -1163,6 +1182,11 @@ class DouyinLearningBot(Star):
         try:
             for e in entries:
                 if e.kind not in {"dm_text", "dm_share", "mention", "comment"}:
+                    continue
+                if e.kind == "dm_text" and not e.extra.get("protocol") and self._ws_claimed(e):
+                    await self.store.inbox_done(e.kind, e.key, "ws_dup")
+                    skipped += 1
+                    why.append("WS 已经认领这条私信")
                     continue
                 if pending_push and self._matches_push(e, pending_push):
                     # 首次快照时队列里已经有这条推送 → 留到 WS 那一轮按新消息处理，
@@ -1216,6 +1240,25 @@ class DouyinLearningBot(Star):
         finally:
             for evt in raw:
                 watcher.release(evt)
+
+    def _ws_mark(self, who: str, text: str) -> None:
+        seen = getattr(self, "_ws_dm_seen", None)
+        if seen is None:
+            seen = self._ws_dm_seen = []
+        seen.append((who or "", text or "", time.time()))
+        del seen[:-40]
+
+    def _ws_claimed(self, entry: Entry, ttl: float = 180.0) -> bool:
+        """这条私信是不是 WS 那一路已经拿去处理过了（同名同文，三分钟内）。"""
+        now = time.time()
+        text = (entry.text or "").strip()
+        who = entry.who or ""
+        for seen_who, seen_text, ts in reversed(getattr(self, "_ws_dm_seen", [])):
+            if now - ts > ttl:
+                break
+            if seen_text == text and (not who or not seen_who or seen_who == who):
+                return True
+        return False
 
     def _matches_push(self, entry: Entry, events: list) -> bool:
         """DOM 读到的这一条，是不是 WS 队列里刚推过来的同一条。"""
