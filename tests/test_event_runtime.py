@@ -226,7 +226,7 @@ class WatcherTests(unittest.IsolatedAsyncioTestCase):
 METHODS = {"_one_event_round", "_handle_mention", "_mention_work", "_entry_event",
            "_send_comment_reply", "_confirm_comment_replies", "_event_loop", "_wait_signal",
            "_attach_watcher", "_on_page_ready", "_attach_event_page",
-           "_ws_claimed", "_ws_mark", "_matches_push"}
+           "_ws_claimed", "_ws_mark", "_ws_self_echo", "_matches_push"}
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -301,6 +301,26 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e.extra["from_uid"], "123")
         await self.app._one_event_round("poll")
         self.app._handle_dm_text.assert_awaited_once()
+
+    async def test_own_message_pushed_back_is_not_promoted(self):
+        """自己发出去的话被推回来一条，不能当新私信处理（否则自己回自己，无限循环）。"""
+        raw = event(text="我发出去的")
+        raw["extra"]["conversation_id"] = "0:1:4330304429101319:4330304429101319"
+        self.app.watcher.drain.return_value = ([raw], {"im"})
+        self.app.settings.dm_self_names = "大肥鱼Yume"
+        self.app.social._uid_cache = {"大肥鱼Yume": {"uid": "123"}}
+        await self.app._one_event_round("ws")
+        self.app._handle_dm_text.assert_not_awaited()
+        self.assertIn(("ws_evidence", "evt1"), self.app.store.rows)
+        self.assertEqual(self.app.store.done[-1][-1], "self_echo")
+
+    async def test_self_name_without_conversation_id_still_blocked(self):
+        raw = event(text="又是我")
+        self.app.settings.dm_self_names = "大肥鱼Yume"
+        self.app.social._uid_cache = {"大肥鱼Yume": {"uid": "123"}}
+        self.app.watcher.drain.return_value = ([raw], {"im"})
+        await self.app._one_event_round("ws")
+        self.app._handle_dm_text.assert_not_awaited()
 
     async def test_same_public_user_only_one_handler_in_round(self):
         self.app._handle_mention = AsyncMock(return_value="queued")
