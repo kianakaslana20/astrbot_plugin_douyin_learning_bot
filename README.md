@@ -591,3 +591,25 @@ MIT，见 [LICENSE](LICENSE)。
 - 改到 `douyin/browser.py`、`douyin/inbox.py` 这类：**重启 AstrBot 核心**最稳。
 
 症状很好认：日志里的报错文案跟你刚改的代码对不上。
+
+## 四点零三、主动发私信（v0.9.7）
+
+以前只能读私信，现在能发。`/dy dm 昵称 话`，默认 ask：先进发件箱，`/dy confirm` 才真发。
+
+发之前会做四道关：白名单（`inbox.dm_targets`，名单空 = 谁都不发）、开关
+（`dm_send_enabled`）、`action_mode`（off 一律不发 / ask 进发件箱 / auto 直接发）、
+配额（`rate_dm_out_per_hour` 3 条、`rate_dm_out_per_day` 20 条；`dm_quota_separate`
+决定是独立算还是跟日常回话共用 `rate_dm_per_hour` 那一池）。
+
+发完一定回读：输入框清空了 **且** 抽屉里出现了这句话才算成功。只等到文字出现还不够
+——字可能还留在输入框里没发出去。确认没发才补一次；确认发了就不重发，避免两条一样的话。
+
+走界面而不是接口，三个原因：私信接口在 imsdk 里（`frontier-im.douyin.com` 的 WebSocket），
+拼不出纯 HTTP；`/v1/message/send` 需要 SDK token；界面上看得见的东西你能直接核对。
+
+「为什么每次都要十几秒」：私信的入口 `data-e2e="im-entry"` 是 im SDK 起来之后才挂上去的，
+实测 11~15 秒。在那之前点顶栏那块地方没有任何反应，所以代码会等到入口出现再点，
+最多等 25 秒。
+
+发件箱落在 `dy.db` 的 `dm_outbox`（`target_uid / text / status / created_at / sent_at / error`），
+`/dy dm 状态` 可以看排队与成败。失败会私聊告诉你，不会静默。
