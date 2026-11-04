@@ -872,6 +872,8 @@ class DouyinLearningBot(Star):
             try:
                 if e.kind == "dm_share":
                     line = await self._handle_dm_share(page, e, umo)
+                elif e.kind == "dm_text":
+                    line = await self._handle_dm_text(e, umo)
                 else:
                     line = await self._handle_mention(page, e, umo)
             except HumanVerifyNeeded as exc:
@@ -909,6 +911,26 @@ class DouyinLearningBot(Star):
         text = f"{head}\n{body}{tail}" if body else head + tail
         await self._notify_text(umo or self._last_umo, text)
         return "看完了，总结发你了" if note else "看完了（模型没给总结，附了原始摘要）"
+
+    async def _handle_dm_text(self, entry: Entry, umo: str) -> str:
+        """别人发来一句话：按人格回一句，发回去。"""
+        if not getattr(self.settings, "dm_chat_enabled", False):
+            return "日常聊天没开（配置里 dm_chat_enabled），只记账不回"
+        allow = [x.strip() for x in (self.settings.dm_chat_allow or "").replace("，", ",").split(",") if x.strip()]
+        who = entry.who or ""
+        if not allow or not any(a == who or a in who or who in a for a in allow):
+            return f"「{who}」不在日常聊天白名单里，不回"
+        why = await self.limits.check_async("dm", self.settings)
+        if why:
+            return f"先不回：{why}"
+        text = await self.voice.chat(their=entry.text or "", umo=umo)
+        if not text:
+            return "没想出合适的回法（模型没给出合格的句子），不硬发"
+        ok = await self.send_dm(who, text)
+        if not ok:
+            return f"回了但没发出去：「{text[:20]}」"
+        await self.limits.hit_async("dm")
+        return f"回了：「{text}」"
 
     async def _handle_mention(self, page, entry: Entry, umo: str) -> str:
         if not entry.aweme_id:
