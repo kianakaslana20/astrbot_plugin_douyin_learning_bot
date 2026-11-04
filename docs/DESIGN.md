@@ -1791,3 +1791,82 @@ take 夹到 1~5、事件进 `dm_judge`、私信走模型判断、自己人免限
 - protobuf 没解：只知道「有动静」，不知道具体是谁说了什么 —— 多一次界面读取代价。
 - 自主刷仍然是「排在队列里跑」，浏览器不是常驻热态，冷启动约 3~5 秒。
 - 事件来源只有私信 + 提醒面板；评论区的实时流没接（那是另一套 `comment/list` 轮询）。
+
+## 32. 解开 IM 推送：protobuf 业务帧与评论区接入（v0.11.0）
+
+### 32.1 为什么 0.10.0 不够
+
+0.10.0 把 WS 当「有动静」的信号，动静一来就去读界面。问题有三个：
+
+1. 读界面有延迟，而且界面是 React 渲染的，元素可能还没挂上；
+2. 拿不到协议层的 `server_message_id`，去重只能靠文本，复读一句「在吗」就分不清；
+3. 评论区、@ 根本没有对应的事件源，只能靠定时扫通知面板。
+
+### 32.2 帧结构与解码路径
+
+`Frame(payload=8, encoding=6, type=7)` → `Response(cmd=1, body=6)`。
+
+- `cmd=500` → `body500.NewMessageNotify.message=5`：正常私信；
+- `cmd=1099` → `body503.Stranger.message=2`：陌生人私信；
+- `MessageBody(sender=7, content=8, type=6, server_message_id=3, create_time=10)`。
+
+内容层 type：7 文本、8/77 作品分享、16/75/105 评论卡；`richTextInfos` 里的 @ 偏移按 UTF-16 算
+（JS 字符串下标口径，不是字节）。
+
+编码：`encoding` 为 lz4 时是标准 raw LZ4 block（无长度前缀，SDK 里 `module45331` 就是这个实现），
+另有 gzip 与 JSON 两种。
+
+**证据边界**：这份 schema 来自第三方重建的抖音 IM SDK（固定 commit），不是官方文档。
+所以解码器对「不认识的命令 / 编码 / 缺身份」只留诊断、不硬编；平台互动通知(frontier-pc)
+的 schema 至今没有实测证据，那一路仍然退回界面读取 —— 日志里 `来源` 字段会区分 `ws` / `poll`。
+
+### 32.3 有界解码
+
+| 限 | 默认 | 为什么 |
+| --- | --- | --- |
+| frame | 1 MiB | 超过直接丢，不尝试 |
+| unpacked | 4 MiB | 防解压炸弹 |
+| fields | 8192 | 防深列表撑爆 |
+| depth | 32 | 防嵌套递归 |
+| json nodes | 16384 | JSON 适配器也要设限 |
+| content | 256 KiB | 单条内容上限 |
+
+畸形帧的后果只有「丢这一条 + 一条诊断」，守护循环不受影响。测试里跑了 1000 组随机字节、
+1000 组结构化变异、全截断扫描，没有逃逸。
+
+### 32.4 事件身份与去重
+
+- `event_id = im:{conversation_id}:{server_message_id}`；
+- `raw_frame_id = sha256(帧字节)`，同一条消息被 Playwright 与 CDP 各报一次时按它去重（2 秒窗口）；
+- 收件箱仍按 `event_id` 幂等，`inbox_done` 之后不会重处理。
+
+### 32.5 评论区为什么不能直接回
+
+IM 里的「评论卡」和「群内 @」是 IM 语义 —— 在群聊里 @ 你一下，不等于他在你视频下评论。
+把这类事件当公开评论去回复，等于跑到评论区 @ 一个根本没在那儿说话的人。所以：
+
+- `extra.channel == "im"` 或 `extra.route == "dm"` → 直接不处理，只记账；
+- 有原始 `comment_id` → `social.reply_comment`（真·回复那条评论）；
+- 没有 `comment_id` → 在视频下发一条评论 @ 回对方（`_send_mention_comment`），不冒充回复。
+
+同一个用户挂着没回完的评论，新事件直接丢 —— 一次只回一条。
+
+### 32.6 挂监听的时机
+
+`Browser._page()` 在把 page 交出去之前回调 `on_page_ready`，`main` 在这里建 `ImWatcher`
+并 `start()`（CDP `Network.webSocketCreated/webSocketFrameReceived`）。这样页面加载期间
+建立的连接也能接管 —— 等到 `goto` 之后再挂，那些 socket 就永远看不到了。
+
+首轮快照（baseline）把已有的消息记成 backlog 不回复，但**队列里已经躺着的那条不算 backlog**：
+`peek()` 出来做文本比对，命中的跳过、留给 WS 那一轮按新消息处理。否则「刚推过来」会被
+「首轮不补历史」这条规则一起埋掉。
+
+### 32.7 验证与遗留
+
+- `tests/test_wsproto.py` 27 项、`tests/test_notice_events.py` 18 项、
+  `tests/test_event_runtime.py` 33 项，全部 synthetic（不启浏览器、不连网）。
+- 真机只验证了「连接建立 + 心跳 + 监听挂上」，**没有捕获过一条真实业务帧**去喂解码器 ——
+  这一点必须说清楚：protobuf 解码只有 synthetic fixture 背书。
+- 平台互动通知(frontier-pc) schema 未知；评论 `comment_id` 的真实链路（点通知 → 打开 → 取 id）
+  没实测过，DOM 里读到的 `comment_id` 只能标 synthetic。
+
