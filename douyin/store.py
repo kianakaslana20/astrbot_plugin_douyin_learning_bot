@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS social_action (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_social_once
     ON social_action(aweme_id, kind, target);
+
+-- 收件箱：私信里的视频链接、评论区 @ 我的提醒、私信消息，都从这里记账。
+-- key 是幂等键（aweme_id / cid / msg_id），同一条只处理一次。
+CREATE TABLE IF NOT EXISTS inbox (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL,          -- dm_video / mention / dm_msg
+    key        TEXT NOT NULL,
+    src        TEXT DEFAULT '',        -- 谁发来的（昵称/会话名）
+    payload    TEXT DEFAULT '',        -- JSON：链接、正文、时间等
+    seen_at    INTEGER,
+    handled_at INTEGER DEFAULT 0,      -- 0 = 还没处理
+    result     TEXT DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_key ON inbox(kind, key);
+CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(handled_at, seen_at DESC);
 """
 
 # status: new → picked → downloaded → analyzed / failed / skipped
@@ -75,6 +90,92 @@ class Store:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    # ---------------------------------------------------------------- 收件箱
+
+    def _inbox_seen_sync(self, kind: str, key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM inbox WHERE kind=? AND key=? LIMIT 1", (kind, key)
+            ).fetchone()
+        return row is not None
+
+    async def inbox_seen(self, kind: str, key: str) -> bool:
+        """这条是不是已经见过（含已处理）。"""
+        return await asyncio.to_thread(self._inbox_seen_sync, kind, key)
+
+    def _inbox_add_sync(self, kind: str, key: str, src: str, payload: str) -> bool:
+        now = int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO inbox(kind, key, src, payload, seen_at, handled_at)
+                   VALUES(?,?,?,?,?,0)""",
+                (kind, key, src, payload, now),
+            )
+            return cur.rowcount > 0
+
+    async def inbox_add(self, kind: str, key: str, src: str = "", payload: str = "") -> bool:
+        """落一条待办；已经存在返回 False（幂等）。"""
+        return await asyncio.to_thread(self._inbox_add_sync, kind, key, src, payload)
+
+    def _inbox_pending_sync(self, kind: str, limit: int) -> list[dict]:
+        sql = "SELECT * FROM inbox WHERE handled_at=0"
+        args: list = []
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        sql += " ORDER BY seen_at ASC LIMIT ?"
+        args.append(limit)
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+    async def inbox_pending(self, kind: str = "", limit: int = 20) -> list[dict]:
+        return await asyncio.to_thread(self._inbox_pending_sync, kind, limit)
+
+    def _inbox_done_sync(self, kind: str, key: str, result: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE inbox SET handled_at=?, result=? WHERE kind=? AND key=?",
+                (int(time.time()), result[:400], kind, key),
+            )
+
+    async def inbox_done(self, kind: str, key: str, result: str = "") -> None:
+        await asyncio.to_thread(self._inbox_done_sync, kind, key, result)
+
+    def _inbox_stats_sync(self) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, COUNT(*) c, SUM(handled_at=0) p FROM inbox GROUP BY kind"
+            ).fetchall()
+        return {r["kind"]: {"total": r["c"], "pending": r["p"] or 0} for r in rows}
+
+    async def inbox_stats(self) -> dict:
+        return await asyncio.to_thread(self._inbox_stats_sync)
+
+    # -------------------------------------------------------------- 保留期
+
+    def _prune_sync(self, keep_days: int) -> dict:
+        """删掉超过保留期的记录，返回删了多少。media 文件由调用方顺手清。"""
+        if keep_days <= 0:
+            return {"aweme": 0, "event": 0, "inbox": 0, "social_action": 0}
+        cutoff = int(time.time()) - keep_days * 86400
+        out = {}
+        with self._connect() as conn:
+            for table, col in (
+                ("aweme", "first_seen"),
+                ("event", "ts"),
+                ("social_action", "ts"),
+            ):
+                cur = conn.execute(f"DELETE FROM {table} WHERE {col} < ?", (cutoff,))
+                out[table] = cur.rowcount
+            cur = conn.execute(
+                "DELETE FROM inbox WHERE handled_at>0 AND handled_at < ?", (cutoff,)
+            )
+            out["inbox"] = cur.rowcount
+        return out
+
+    async def prune(self, keep_days: int) -> dict:
+        return await asyncio.to_thread(self._prune_sync, keep_days)
 
     def _init_sync(self) -> None:
         with self._connect() as conn:
