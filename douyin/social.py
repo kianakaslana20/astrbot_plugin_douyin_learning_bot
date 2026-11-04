@@ -449,7 +449,7 @@ class Social:
     # 别的视频上。接口版回包直接给 cid，发没发、发在哪条视频上一目了然。
     PUBLISH_FN = """
     async (args) => {
-      const [awemeId, text, extra] = args;
+      const [awemeId, text, extra, replyId = '0'] = args;
       const q = new URLSearchParams({
         app_name: 'aweme', enter_from: 'video_detail', previous_page: 'video_detail',
         device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web',
@@ -460,7 +460,7 @@ class Social:
         platform: 'PC', downlink: '10',
       });
       const body = new URLSearchParams({
-        reply_id: '0', reply_to_reply_id: '0', aweme_id: awemeId, text,
+        reply_id: replyId, reply_to_reply_id: '0', aweme_id: awemeId, text,
         text_extra: extra || '[]',
         comment_send_celltime: '0', comment_video_celltime: '0',
       });
@@ -1035,6 +1035,21 @@ class Social:
         return done, pending
 
     # ---------- 评论 ----------
+
+    async def reply_comment(self, aweme_id: str, comment_id: str, text: str) -> ActionResult:
+        """Reply to a known comment, never silently post a top-level replacement.
+
+        One publish attempt only: an ambiguous response must not duplicate a reply.
+        """
+        if not (str(aweme_id).isdigit() and str(comment_id).isdigit() and text.strip()):
+            return ActionResult(False, "comment", "回复", "原评论/视频 id 或内容缺失")
+        if not await self.logged_in():
+            return ActionResult(False, "comment", "回复", "登录状态未就绪")
+        page = await self._page()
+        result = await page.evaluate(self.PUBLISH_FN, [aweme_id, text, "[]", comment_id])
+        if isinstance(result, dict) and result.get("code") == 0 and result.get("cid"):
+            return ActionResult(True, "comment", "回复", "服务端确认 cid=" + str(result["cid"]))
+        return ActionResult(False, "comment", "回复", "服务端未确认回复，未自动重试")
 
     async def comment(self, aweme_id: str, text: str, mentions: list[str] | None = None) -> ActionResult:
         mentions = [m.strip() for m in (mentions or []) if m and m.strip()]
