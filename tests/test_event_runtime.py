@@ -18,6 +18,24 @@ from unittest.mock import AsyncMock, Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
+class Entry:
+    """生产端 douyin.inbox.Entry 的本地替身：只有属性和 describe。"""
+
+    def __init__(self, kind="", key="", aweme_id="", who="", text="", when="", src="", extra=None):
+        self.kind = kind
+        self.key = key
+        self.aweme_id = aweme_id
+        self.who = who
+        self.text = text
+        self.when = when
+        self.src = src
+        self.extra = dict(extra or {})
+
+    def describe(self):
+        return f"{self.kind}:{self.who}:{self.text}"
+
+
+
 
 def extract(path, class_name=None, names=None, **namespace):
     tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
@@ -207,12 +225,13 @@ class WatcherTests(unittest.IsolatedAsyncioTestCase):
 
 METHODS = {"_one_event_round", "_handle_mention", "_mention_work", "_entry_event",
            "_send_comment_reply", "_confirm_comment_replies", "_event_loop", "_wait_signal",
-           "_attach_watcher", "_on_page_ready", "_attach_event_page"}
+           "_attach_watcher", "_on_page_ready", "_attach_event_page",
+           "_ws_claimed", "_ws_mark", "_matches_push"}
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.Subject = extract(ROOT / "main.py", names=METHODS)
+        self.Subject = extract(ROOT / "main.py", names=METHODS, Entry=Entry)
         self.app = self.Subject()
         self.app.settings = types.SimpleNamespace(action_mode="ask", event_ws=True)
         self.app.browser = types.SimpleNamespace(page=AsyncMock(return_value="PAGE"))
@@ -255,15 +274,21 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.app._handle_dm_share_event.assert_awaited_once()
         self.app._handle_mention.assert_awaited_once()
 
-    async def test_unmatched_raw_echo_never_sends(self):
+    async def test_unmatched_raw_dm_is_promoted_not_dropped(self):
+        """界面没读到时，协议层解出来的私信要自己走一遍链路，不能只剩一条证据。"""
         raw = event()
         self.app.watcher.drain.return_value = ([raw], {"im"})
         self.app.social._uid_cache = {"Alice": {"uid": "123"}}
         await self.app._one_event_round("ws")
-        self.app._handle_dm_text.assert_not_awaited()
+        self.app._handle_dm_text.assert_awaited_once()
+        handled = self.app._handle_dm_text.await_args[0][0]
+        self.assertTrue(handled.extra["protocol"])
+        self.assertEqual(handled.extra["source"], "ws")
+        self.assertEqual(handled.who, "Alice")
+        self.assertEqual(handled.text, raw["content"])
         self.app._handle_dm_share_event.assert_not_awaited()
-        self.app.agent.handle_douyin_event.assert_not_awaited()
-        self.assertIn(("ws_evidence", "evt1"), self.app.store.rows)
+        # 已经提升成条目，就不再另写一条「等身份」的证据
+        self.assertNotIn(("ws_evidence", "evt1"), self.app.store.rows)
         self.app.watcher.release.assert_called_once_with(raw)
 
     async def test_matching_raw_enriches_one_dom_and_not_replayed(self):
