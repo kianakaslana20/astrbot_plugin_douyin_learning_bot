@@ -1,7 +1,7 @@
-"""收件箱：把「私信里别人发来的视频」和「评论里 @ 我的提醒」捞成条目。
+"""收件箱：将私信、评论/回复和 @ 通知归一为条目。
 
-两条来源都只能走界面（私信消息在 imsdk 长连接里，纯 HTTP 拼不出来；提醒同理），
-所以这里干的事就是：点开面板 → 逐条读 → 该点开的点开拿 aweme_id → 记进 inbox 表。
+既保留界面采集，也提供规范 WS dict → Entry 的纯转换接口。
+DOM 扩展与 WS 转换由 synthetic fixtures 验证，未连接线上/浏览器验证。
 
 去重靠 `Store.inbox_add()` 的 `UNIQUE(kind, key)`，所以重复扫不会重复处理、也不会重复回人。
 """
@@ -41,7 +41,7 @@ async (awemeId) => {
 
 @dataclass
 class Entry:
-    kind: str                    # dm_share / mention
+    kind: str                    # dm_text / dm_share / mention / comment
     key: str = ""                # 幂等键
     aweme_id: str = ""
     who: str = ""
@@ -55,6 +55,8 @@ class Entry:
             head = f"私信 · {self.who or '有人'} 发来一条视频"
         elif self.kind == "dm_text":
             head = f"私信 · {self.who or '有人'} 说"
+        elif self.kind == "comment":
+            head = f"评论提醒 · {self.who or '有人'} 评论/回复了你"
         else:
             head = f"评论提醒 · {self.who or '有人'} 在评论里 @ 了你"
         if self.text:
@@ -75,6 +77,51 @@ class Inbox:
         self.settings = settings
         self.dm = DirectMessages(browser)
         self.notices = Notices(browser)
+
+    @staticmethod
+    def event_entry(evt: dict) -> Entry | None:
+        """规范 WS 事件转 Entry；缺失字段留空，extra.missing_fields 交给后续补齐。
+
+        接受 type（或 kind）、from_nick、content、timestamp；兼容 text/time。
+        event_id 优先用作幂等键；仅 comment_id 可充当评论的原始键。
+        没有原始 id 时 key 留空，不把一整帧或昵称/正文冒充事件 id。
+        """
+        if not isinstance(evt, dict):
+            return None
+        kind = {"dm": "dm_text", "share": "dm_share", "dm_text": "dm_text",
+                "dm_share": "dm_share", "mention": "mention", "comment": "comment"}.get(
+                    evt.get("type") or evt.get("kind"))
+        if not kind:
+            return None
+
+        def value(name, fallback=None):
+            raw = evt.get(name)
+            if raw is None and fallback:
+                raw = evt.get(fallback)
+            return str(raw).strip() if isinstance(raw, (str, int, float)) and not isinstance(raw, bool) else ""
+
+        extra = dict(evt.get("extra")) if isinstance(evt.get("extra"), dict) else {}
+        for name in ("event_id", "raw_frame_id", "from_uid", "comment_id", "timestamp"):
+            extra[name] = evt.get(name, "")
+        if "timestamp" not in evt and "time" in evt:
+            extra["timestamp"] = evt["time"]
+        key = value("event_id")
+        if not key and kind in {"mention", "comment"}:
+            key = value("comment_id")
+        text = value("content", "text")
+        uid = value("from_uid")
+        missing = [name for name, val in (("from_uid", uid), ("text", text)) if not val]
+        if not key:
+            missing.append("event_id")
+        if kind in {"mention", "comment"} and not value("comment_id"):
+            missing.append("comment_id")
+        if kind in {"dm_share", "mention", "comment"} and not value("aweme_id"):
+            missing.append("aweme_id")
+        extra["missing_fields"] = missing
+        extra["pending_enrichment"] = bool(missing)
+        return Entry(kind=kind, key=key, aweme_id=value("aweme_id"),
+                     who=value("from_nick"), text=text, when=value("timestamp", "time"),
+                     src=value("src"), extra=extra)
 
     # ------------------------------------------------------------------ 采集
 
@@ -166,15 +213,24 @@ class Inbox:
             if not aid:
                 # 同一个人的同一句话只记一次，拿不到视频 id 也留着，方便主人自己点
                 aid = ""
+            kind = getattr(mt, "kind", "mention")
+            event_id = getattr(mt, "event_id", "")
+            comment_id = getattr(mt, "comment_id", "")
+            uid = getattr(mt, "uid", "")
+            missing = [name for name, value in (("from_uid", uid), ("text", mt.text),
+                       ("comment_id", comment_id), ("aweme_id", aid)) if not value]
             out.append(
                 Entry(
-                    kind="mention",
-                    key=f"mt:{aid or mt.who}:{mt.text[:16]}",
+                    kind=kind,
+                    key=event_id or comment_id or f"{'mt' if kind == 'mention' else 'cm'}:{aid or mt.who}:{mt.text[:16]}",
                     aweme_id=aid,
                     who=mt.who,
                     text=mt.text,
                     when=mt.when,
                     src=mt.raw,
+                    extra={"event_id": event_id, "raw_frame_id": "", "from_uid": uid,
+                           "comment_id": comment_id, "timestamp": "",
+                           "missing_fields": missing, "pending_enrichment": bool(missing)},
                 )
             )
         return out
