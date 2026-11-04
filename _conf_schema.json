@@ -86,6 +86,18 @@
         "description": "粘贴式 cookie",
         "default": "",
         "hint": "浏览器登录 douyin.com 后，F12 → Network → 随便点一个请求 → Request Headers 里 `cookie:` 那整行复制过来贴这儿。只填 k=v; k=v 部分。msToken / a_bogus 不用管：评论和点赞是在页面里发的，签名由页面自己算。"
+      },
+      "channel_strict": {
+        "type": "bool",
+        "default": false,
+        "description": "内核起不来就报错，不退回 chromium",
+        "hint": "开着 = 只用 Edge。起不来（比如 Edge 占着同一个 profile）会直接报错说明原因，不会偷偷换成 Playwright 自带 chromium——换内核在抖音眼里等于换了台机器。"
+      },
+      "profile_pin": {
+        "type": "bool",
+        "default": false,
+        "description": "钉死当前 profile 目录（不做自动迁移）",
+        "hint": "开着就绝不动目录。自动迁移会换目录，抖音会当成新设备：登录态、验证记录都重来。"
       }
     }
   },
@@ -416,6 +428,102 @@
         "default": "",
         "description": "额外禁词（逗号分隔）",
         "hint": "内置一份 AI 腔黑名单（首先/其次/综上/这个视频/干货满满…），命中会重写一次。这里补你自己的：比如某个口头禅、某个不能提的词。"
+      },
+      "rate_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "启用频率限制",
+        "hint": "关掉就是不限次数（不建议）。计数存在 dy.db 里，重载/重启都还在。"
+      },
+      "rate_comment_per_day": {
+        "type": "int",
+        "default": 8,
+        "description": "评论：每天最多几条",
+        "hint": "评论是最贵的一档（要过审）。8 条/天已经很活跃了，20 以上像机器人。"
+      },
+      "rate_share_per_day": {
+        "type": "int",
+        "default": 10,
+        "description": "分享：每天最多几次",
+        "hint": "分享不直接对外发言，但刷屏式转发同样会被盯。"
+      },
+      "rate_like_per_day": {
+        "type": "int",
+        "default": 30,
+        "description": "点赞：每天最多几个",
+        "hint": "点赞最便宜，但一天几百个一样异常。"
+      },
+      "rate_dm_per_hour": {
+        "type": "int",
+        "default": 6,
+        "description": "私信：每小时最多回几条",
+        "hint": "私信回复的节奏是 0.9.x 的功能用的；先在这里定好上限。"
+      },
+      "quiet_hours": {
+        "type": "string",
+        "default": "",
+        "description": "静默时段（例 01:00-08:00）",
+        "hint": "这段时间不发任何评论/分享/点赞/私信。支持跨午夜（23:00-07:00）。半夜秒回是最明显的机器人特征。"
+      },
+      "pending_ttl_hours": {
+        "type": "int",
+        "default": 12,
+        "description": "待确认动作多久作废（小时）",
+        "hint": "ask 模式攒下的分享/评论，超过这么久还没确认就作废——放久了再执行，视频本身都凉了，评论也显得莫名其妙。0 = 不过期。"
+      },
+      "action_jitter": {
+        "type": "bool",
+        "default": true,
+        "description": "动作间隔随机化",
+        "hint": "固定 6 秒一次连着十次，比任何行为都像脚本。开着取 0.6~1.8 倍随机，偶尔更久（像在看手机）。"
+      },
+      "keep_days": {
+        "type": "int",
+        "default": 30,
+        "description": "记录与临时文件保留天数",
+        "hint": "超过这个天数的看片记录、动作日志、下载的视频与拼图会被清掉。0 = 不清理。"
+      },
+      "inbox_dm": {
+        "type": "bool",
+        "description": "翻私信：别人发来的视频链接",
+        "default": true,
+        "hint": "只读会话里的分享卡片，不回复任何人"
+      },
+      "inbox_mentions": {
+        "type": "bool",
+        "description": "翻提醒：评论区 @ 我的",
+        "default": true,
+        "hint": "点开提醒拿到视频 id，再决定要不要回复"
+      },
+      "inbox_max_conversations": {
+        "type": "int",
+        "description": "一次最多翻几个会话",
+        "default": 8,
+        "hint": "按最近聊天排序，太大的话一轮会很慢"
+      },
+      "inbox_max_cards": {
+        "type": "int",
+        "description": "每个会话最多点开几张分享卡片",
+        "default": 3,
+        "hint": "点开卡片才能拿到视频 id，一张约 2 秒"
+      },
+      "inbox_share_summary": {
+        "type": "bool",
+        "description": "私信视频看完写一段总结",
+        "default": true,
+        "hint": "用当前人格写，像人写的，不用模板"
+      },
+      "inbox_mention_reply": {
+        "type": "bool",
+        "description": "@ 我的评论看完回一句",
+        "default": true,
+        "hint": "写操作，仍受 action_mode 与频率限制约束"
+      },
+      "dm_allow": {
+        "type": "string",
+        "description": "私信白名单（逗号分隔，空=不限）",
+        "default": "",
+        "hint": "/dy dm 只能发给名单里的人"
       }
     }
   },
