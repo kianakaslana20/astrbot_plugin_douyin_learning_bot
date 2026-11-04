@@ -1050,11 +1050,18 @@ class DouyinLearningBot(Star):
                     return
                 if self.watcher is not None:
                     await self.watcher.close()
-                self.watcher = ImWatcher(page)
-                await self.watcher.start()
+                self.watcher = await self._make_watcher(page)
                 logger.info("事件守护：页面刚建就挂上 WS 监听（导航前）")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("事件守护：提前挂 WS 没成功（%s），等事件循环再试", exc)
+
+    async def _make_watcher(self, page) -> "ImWatcher":
+        """新建监听器：`action_dump` 打开时顺手把原始帧落盘，方便事后验 schema。"""
+        watcher = ImWatcher(page)
+        if getattr(self.settings, "action_dump", False):
+            watcher.dump_dir = str(self.data_dir / "ws_dumps")
+        await watcher.start()
+        return watcher
 
     async def _event_loop(self) -> None:
         """Attach before navigation; business pushes wake the consumer, not a scan timer."""
@@ -1068,9 +1075,8 @@ class DouyinLearningBot(Star):
                 if self.watcher is None or self.watcher.page is not page:
                     if self.watcher is not None:
                         await self.watcher.close()
-                    self.watcher = ImWatcher(page)
-                    await self.watcher.start()
-                    logger.info("事件守护：已挂 WS/CDATA 监听（导航前）")
+                    self.watcher = await self._make_watcher(page)
+                    logger.info("事件守护：已挂 WS 监听（导航前）")
                 if "douyin.com" not in (page.url or ""):
                     await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=45000)
                 if not getattr(self, "_dm_warmed", False):
