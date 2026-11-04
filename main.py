@@ -110,6 +110,8 @@ HELP_TEXT = """/dy            状态与用法
     "/dy inbox                翻私信和 @ 提醒，列出新到的视频（加「处理」才动手）",
     "/dy dm 昵称 内容          用登录的号给某人发一条私信（走 dm_allow 白名单）",
 /dy update     检查 GitHub 上有没有新版本（apply 直接拉取）
+/dy dm 昵称 话  给这个人发条抖音私信（ask 模式会先攒着）
+/dy confirm     把攒着的私信真发出去
 /dy stop       关掉浏览器，释放内存"""
 
 SUB_ALIASES = {
@@ -146,6 +148,9 @@ SUB_ALIASES = {
     "配置": "cfg",
     "参数": "cfg",
     "白名单": "cfg",
+    "发送": "send",
+    "发出去": "confirm",
+    "发出": "confirm",
     "收件箱": "inbox",
     "私信": "dm",
     "提醒": "inbox",
@@ -1042,9 +1047,7 @@ class DouyinLearningBot(Star):
                         ensure_ascii=False,
                     )):
                         fresh.append(e)
-                logger.info(
-                    "私信守护：本轮读到 %s 条私信内容，新 %s 条", len(entries or []), len(fresh)
-                )
+                replied = 0
                 first = not getattr(self, "_dm_warmed", False)
                 self._dm_warmed = True
                 for e in fresh:
@@ -1054,6 +1057,8 @@ class DouyinLearningBot(Star):
                         continue
                     try:
                         line = await self._handle_dm_text(e, self._last_umo or "")
+                        if line.startswith("回了："):
+                            replied += 1
                         logger.info("私信守护：%s", line)
                     except HumanVerifyNeeded:
                         logger.warning("私信守护撞到人机验证，暂停这一轮")
@@ -1069,6 +1074,10 @@ class DouyinLearningBot(Star):
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("私信守护出错：%s", exc)
                     await self.store.inbox_done(e.kind, e.key, "watcher")
+                logger.info(
+                    "私信守护：本轮读到 %s 条私信内容，新 %s 条，已回 %s 条",
+                    len(entries or []), len(fresh), replied,
+                )
             except asyncio.CancelledError:
                 logger.info("私信守护已停止")
                 return
@@ -1113,9 +1122,9 @@ class DouyinLearningBot(Star):
         text = await self.voice.chat(their=entry.text or "", umo=umo, memory=memory)
         if not text:
             return "没想出合适的回法（模型没给出合格的句子），不硬发"
-        ok = await self.send_dm(who, text)
+        ok, detail = await self.send_dm(who, text, allow=[], check_limit=False)
         if not ok:
-            return f"回了但没发出去：「{text[:20]}」"
+            return f"回了但没发出去：「{text[:20]}」（{detail}）"
         self.memory.remember(who, "me", text)
         if not unlimited:
             await self.limits.hit_async("dm")
@@ -1150,13 +1159,71 @@ class DouyinLearningBot(Star):
         await self.limits.hit_async("comment")
         return f"回了：{text}"
 
-    async def send_dm(self, who: str, text: str) -> bool:
-        """按昵称找人发一条私信（走界面）。"""
-        page = await self.browser.page()
-        dm = self.inbox.dm
-        if not await dm.open_conversation(page, who):
-            return False
-        return await dm.send_text(page, text)
+    # ---------------------------------------------------------------- 私信发送
+    #
+    # 为什么走界面而不是私信接口：imapi 那套要走 imsdk（wss + 自签 token），
+    # 而且发消息的风控比评论更严。界面发虽然没有服务端回执，但可以「发完回读
+    # 最后一条气泡」来确认 —— 这就是 dm_readback 的作用。
+
+    def _dm_targets(self, config_attr: str = "dm_targets") -> list[str]:
+        raw = getattr(self.settings, config_attr, "") or ""
+        return [x.strip() for x in raw.replace("，", ",").replace("、", ",").split(",") if x.strip()]
+
+    def _dm_allowed(self, target: str, names: list[str]) -> bool:
+        t = (target or "").strip()
+        return any(a and (a == t or a in t or t in a) for a in names)
+
+    def _dm_limit_kind(self) -> str:
+        """主动发私信算哪一类配额：分开了就是 dm_out，否则和「回私信」共用 dm。"""
+        return "dm_out" if getattr(self.settings, "dm_quota_separate", True) else "dm"
+
+    async def send_dm(self, who: str, text: str, *, allow=None, check_limit: bool = True) -> tuple:
+        """发一条私信，返回 (成功?, 说明)。allow=None 表示不校验白名单。"""
+        if not text or not text.strip():
+            return False, "内容是空的"
+        if allow is None:
+            allow = self._dm_targets()
+        if check_limit:
+            why = await self.limits.check_async(self._dm_limit_kind(), self.settings)
+            if why:
+                return False, f"先不发：{why}"
+        ok, detail = await self.social.send_dm(who, text, allow=allow)
+        if ok and check_limit:
+            await self.limits.hit_async(self._dm_limit_kind())
+        return ok, detail
+
+    async def _dm_send_queued(self, row_id: int, who: str, text: str, umo: str = "") -> str:
+        """执行发件箱里的一条（失败会通知主人）。"""
+        ok, detail = await self.send_dm(who, text)
+        if ok:
+            await self.store.dm_mark(row_id, "sent")
+            logger.info("私信已发：%s（%s）", who, detail)
+            return f"✅ 发给「{who}」：{text[:40]}" + ("" if len(text) <= 40 else "…")
+        await self.store.dm_mark(row_id, "failed", detail)
+        logger.warning("私信没发出去：%s（%s）", who, detail)
+        try:
+            await self._ask_help(
+                f"私信没发出去：「{who}」\n原因：{detail}\n"
+                f"内容：{text[:80]}\n要看怎么办：/dy dm 状态",
+                umo=umo,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return f"❌ 发给「{who}」失败：{detail}"
+
+    async def _dm_flush(self, umo: str = "", limit: int = 10) -> list[str]:
+        """把待发队列里到期的都发出去（/dy confirm 走这条路）。"""
+        rows = await self.store.dm_pending(limit)
+        if not rows:
+            return []
+        out = []
+        for row in rows:
+            out.append(
+                await self._dm_send_queued(
+                    int(row["id"]), str(row.get("target_uid") or ""), str(row.get("text") or ""), umo
+                )
+            )
+        return out
 
     async def _pick_item(self, aweme_id: str = "") -> _ItemRef | None:
         """优先用指定 aweme_id，否则取知识库里最近一条已分析的视频。"""
@@ -2016,9 +2083,15 @@ class DouyinLearningBot(Star):
                 yield event.plain_result("已取消这轮写操作")
                 return
             if not self._pending:
+                dm_wait = await self.store.dm_pending(10)
+                if dm_wait:
+                    yield event.plain_result(f"开始发 {len(dm_wait)} 条待发私信…")
+                    out = await self._dm_flush(event.unified_msg_origin)
+                    yield event.plain_result("\n".join(out) if out else "发完了。")
+                    return
                 yield event.plain_result(
                     "没有待执行的动作。action_mode=ask 时刷完一轮会问你一次；"
-                    "也可以直接用 /dy share、/dy comment"
+                    "也可以直接用 /dy share、/dy comment、/dy dm"
                 )
                 return
             pairs = self._pending
@@ -2036,6 +2109,9 @@ class DouyinLearningBot(Star):
             yield event.plain_result(f"开始执行 {len(pairs)} 条视频的分享/评论…")
             lines = await self._do_actions(pairs)
             yield event.plain_result("\n".join(lines) or "没有需要执行的（这些视频可能都做过了）")
+            dm_lines = await self._dm_flush(event.unified_msg_origin)
+            if dm_lines:
+                yield event.plain_result("待发的私信：\n" + "\n".join(dm_lines))
             return
 
         if sub in {"dom", "probe", "校准"}:
@@ -2092,26 +2168,62 @@ class DouyinLearningBot(Star):
             yield event.plain_result("\n".join(report) if report else "处理完了，没什么可说的。")
             return
 
-        if sub in {"dm", "message", "发私信"}:
+        if sub in {"dm", "message", "发私信", "send"}:
             await self._ensure_ready()
+            if len(args) >= 2 and args[1] in {"状态", "status", "日志", "log"}:
+                stats = await self.store.dm_stats()
+                rows = await self.store.dm_pending(10)
+                lines = ["私信发件箱："]
+                for k in ("pending", "sent", "failed", "skipped"):
+                    lines.append(f"　{k}：{stats.get(k, 0)}")
+                if rows:
+                    lines.append("待发：")
+                    for r in rows:
+                        lines.append(f"　#{r['id']} → {r['target_uid']}：{str(r['text'])[:40]}")
+                    lines.append("发 /dy confirm 就发出去")
+                yield event.plain_result("\n".join(lines))
+                return
             if len(args) < 3:
-                yield event.plain_result("用法：/dy dm 昵称 要说的话")
+                yield event.plain_result(
+                    "用法：/dy dm 昵称 要说的话（或 /dy send 昵称 话）\n"
+                    "查发件箱：/dy dm 状态"
+                )
+                return
+            if not getattr(self.settings, "dm_send_enabled", True):
+                yield event.plain_result("主动发私信是关的（配置 → 私信 → dm_send_enabled）")
                 return
             who, text = args[1], " ".join(args[2:])
-            allow = [x.strip() for x in (self.settings.dm_allow or "").split(",") if x.strip()]
-            if allow and not any(a == who or a in who or who in a for a in allow):
-                yield event.plain_result(f"「{who}」不在私信白名单里（面板 actions.dm_allow）")
+            targets = self._dm_targets()
+            if not targets:
+                yield event.plain_result("私信白名单是空的（私信 → dm_targets），谁都不发")
                 return
-            why = await self.limits.check_async("dm", self.settings)
-            if why:
-                yield event.plain_result(f"先不发：{why}")
+            if not self._dm_allowed(who, targets):
+                yield event.plain_result(f"「{who}」不在私信白名单里（私信 → dm_targets）")
                 return
-            ok = await self.send_dm(who, text)
-            if ok:
-                await self.limits.hit_async("dm")
-                yield event.plain_result(f"发给「{who}」了：{text}")
-            else:
-                yield event.plain_result(f"没发出去（会话「{who}」打不开，或输入框没出来）")
+            mode = (getattr(self.settings, "action_mode", "ask") or "ask").lower()
+            if mode == "off":
+                yield event.plain_result("action_mode=off，写操作一律不执行")
+                return
+            if mode == "ask":
+                row_id = await self.store.dm_queue(who, text)
+                yield event.plain_result(
+                    f"先放着（ask 模式）：#{row_id} → 「{who}」\n内容：{text}\n"
+                    f"确认发出去就发 /dy confirm；12 小时内不发就作废。"
+                )
+                return
+            row_id = await self.store.dm_queue(who, text)
+            yield event.plain_result(await self._dm_send_queued(row_id, who, text, event.unified_msg_origin))
+            return
+
+        if sub in {"confirm", "确认", "发出", "发出去"}:
+            await self._ensure_ready()
+            stats = await self.store.dm_stats()
+            if not stats.get("pending"):
+                yield event.plain_result("没有待发的私信（/dy dm 状态 可以看发件箱）")
+                return
+            yield event.plain_result(f"开始发 {stats.get('pending')} 条待发私信…")
+            out = await self._dm_flush(event.unified_msg_origin)
+            yield event.plain_result("\n".join(out) if out else "发完了。")
             return
 
         if sub in {"kb", "list"}:
