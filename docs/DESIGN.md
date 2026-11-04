@@ -1492,3 +1492,104 @@ resp = await prov.text_chat(prompt=..., system_prompt=persona["prompt"] + 规则
 - 没有对同一条视频的"第二次评论"策略，也不该有
 - 语气只在 prompt 层，没有 few-shot 样本；真正稳的做法是把用户自己写过的评论塞 3 条进去
 
+## 25. 闸门：让写操作像个人（v0.8.6）
+
+### 25.1 为什么计数必须落库
+
+内存计数有个隐蔽的退步：重载插件 = 配额清零。AstrBot 里重载是常态（改配置、更新），
+于是「今天最多 8 条评论」会变成「每次重载后 8 条」。`rate_hit(kind, ts)` 落 `dy.db`，
+按时间窗 `COUNT(*)`，重载、重启都在。
+
+### 25.2 四档预算，不是一个总数
+
+| 动作 | 默认 | 窗口 | 为什么这么定 |
+|---|---|---|---|
+| 点赞 | 30 | 天 | 最便宜，但一天几百个同样异常 |
+| 分享 | 10 | 天 | 不对外发言，但刷屏式转发会被盯 |
+| 评论 | 8 | 天 | 最贵，要过审，还有二级验证 |
+| 私信 | 6 | 小时 | 对话要看上下文，按天算会把一场聊天掐死 |
+
+### 25.3 静默时段
+
+`quiet_hours="01:00-08:00"`，`parse_quiet` 支持 `23:00-07:00` 跨午夜（`start > end` 分支）。
+判断用本地时间；格式错、空串一律当「不静默」——配置写错不该让功能全停。
+
+### 25.4 随机间隔
+
+固定间隔是最好复现的指纹：每 6.0 秒一次，连续十次。`_human_pause()` 取 0.6~1.8 倍，
+另有 15% 概率乘 1.6~2.4（像中途看了眼别处）。`action_jitter=false` 退回固定值。
+
+### 25.5 幂等收件箱
+
+```
+inbox(id, kind, key, src, payload, seen_at, handled_at, result)
+UNIQUE INDEX idx_inbox_key(kind, key)
+```
+`inbox_add` 用 `INSERT OR IGNORE`，返回 `rowcount > 0`：重复进来直接 False。
+`inbox_pending(kind, limit)` 只取 `handled_at=0`；`inbox_done` 写回执。
+这不只是去重——它是 0.9 私信/提醒能安全重跑的前提。
+
+### 25.6 三个「不该自己变」的开关
+
+- `channel_strict`：`_ensure()` 的 fallback 分支前判断，真就 `_shutdown_playwright()` + 抛 `DouyinBlocked`。
+  静默换内核 = 换机器指纹 = 登录态和风控画像重来。
+- `profile_pin`：`_migrate_kernel_profile` 开头直接 return，只记一次日志。
+- `keep_days`：`_retire()` 在每轮 job 开头跑，删 `aweme/event/social_action` 与已处理 inbox，
+  再清 `work/` 里超期文件（跳过 `.json`/`.db`，否则会把 uid 缓存和库删了）。
+
+### 25.7 验证
+
+`_test_dy_086.py` 22 项：静默跨午夜 / 到上限被拦 / 关开关放行 / dm 按小时 / inbox 幂等与 stats /
+保留期只删旧的 / 随机区间上下界 / 关掉随机回固定值。命令、队列、验证、文案、uid 缓存回归全绿。
+
+## 26. 收件箱：私信与提醒怎么读（v0.9.0）
+
+### 26.1 为什么不走接口
+
+私信消息走 `imapi.douyin.com` 的 imsdk：`appKey=e1bd35ec9db7b8d846de66ed140b1ad9`、`service=5`、`frontierUrl=wss://frontier-im.douyin.com/ws/v2`，收发都在 WebSocket 上，`/aweme/v1/web/im/*` 直接 404（`Unsupported path(Janus)`）。提醒面板同理没有公开读接口。结论：这两条读界面，成本是每次约 20~40 秒，收益是不用逆向一套带状态的协议。
+
+### 26.2 私信面板的四个实测细节
+
+1. `[data-e2e="im-entry"]` 在顶栏 x≈1478,y≈28；**点它必须 hover 再 mouse.click**。`page.evaluate("…click()")` 出来的 `[data-e2e="im-dialog"]` 宽高都是 0，DOM 有内容但 Playwright 认为不可见，后续 locator 全部超时。
+2. 面板 336×932，会话行 `[data-e2e="conversation-item"]`，行内三段：`conversationConversationItemtitle`（昵称，含 `\n` 要切）、`ConversationItemDescleft`（预览）、`ConversationItemTagNextToTitle`（时间）。预览里就能看出类型：`分享[视频]`。
+3. 会话内 `[data-e2e="msg-item-content"]` 一条消息一个；分享卡片 `div.MessageItemShareAwemecontainer`。
+4. **卡片里没有 aweme_id**，只有封面图 URL；点开后地址栏变成 `https://www.douyin.com/jingxuan?modal_id=<id>` → 从 `modal_id=` 取。Esc 关闭后要确认 modal 消失，并把地址栏的 `modal_id` 擦掉，否则下一条会被误认。
+
+`mine` 的判定不能用 class 名猜（`closest('[class*="right"]')` 会把所有气泡判成自己的），用**气泡中心 x 与面板中线**比：`x > dr.x + dr.width*0.62` 即自己的。
+
+### 26.3 提醒面板
+
+点顶栏「通知」→ `[data-e2e="listDlgTest-container"]`（328×696）。`innerText` 直接可读，条目形如：
+
+```
+yezheyue 朋友 @大肥鱼Yume 在评论中提到了你05:31
+yezheyue 朋友 模型里面有敏感限制吗[看]我想给我家鱼安排上@大肥鱼Yume 在评论中提到了你05:29
+```
+
+`parse_row` 剥零宽字符 → 抽时间 → 去「在评论中提到了你」尾巴 → 滤掉 `朋友/互相关注/关注了你/·/|` → 首段当昵称、其余当评论正文。条目本身不带 aweme_id，点开才跳转，取 `modal_id`。
+
+坑：图标字体没加载完时，文字是「通知」的最外层是 `ul`（32×44），内层 `span` 还没渲染 —— 选择器要求 `children.length === 0` 会永远找不到。改成取**面积最小**的那个候选。
+
+### 26.4 幂等与队列
+
+`inbox(kind, key, src, payload, seen_at, handled_at, result)`，`UNIQUE(kind, key)`：
+
+- 私信视频 `key = dm:<aweme_id>`
+- 提醒 `key = mt:<aweme_id>:<正文前16字>`（没拿到 id 时退化）
+
+`/dy inbox` 只扫不收钱（只读），`/dy inbox 处理` 才动手；处理的对象是 `inbox_pending()`（库里所有没处理的），不是本轮新扫到的 —— 否则「扫一次不处理、第二次就没得处理」。`payload` 存 JSON 字符串（`sqlite3` 不接受 dict，这条踩过一次）。
+
+### 26.5 处理链路
+
+| 来源 | 链路 |
+|---|---|
+| 私信视频 | `fetch_item`（`aweme/detail/`）→ `pipeline._handle_one`（下载/抽帧/转写/理解）→ `voice.summary` → 推给主人 |
+| @ 提醒 | `fetch_item` → `_handle_one` → `limits.check_async("comment")` → `voice.reply` → `social.comment(aid, text, [who])` → `limits.hit_async("comment")` |
+
+写操作仍受 `action_mode`/频率/静默/随机延迟约束；撞 `HumanVerifyNeeded` 就地停下并提示 `/dy verify`。
+
+### 26.6 遗留
+
+- 私信只处理「别人发来的分享卡片」，纯文本聊天还没接（`DirectMessages.send_text` 已具备，缺的是轮询与语气样本）。
+- 会话列表只翻最近 8 个、每个会话最多点开 3 张卡，超过的漏掉；要更全就把 `inbox_max_conversations` 调大，代价是扫描时间线性增长。
+- `_share_aweme_id` 依赖点开卡片 → 有 2 秒/张的硬成本，没有更快的路。
