@@ -69,6 +69,11 @@ SCHEMA_FIELDS = {
                     "property_list": 15, "user_profile": 16},
 }
 NOTIFY_TYPES = {1: "PER_USER", 2: "PER_CONVERSATION"}
+# 实测（2026-11-05，frontier-im 真实帧 1.2 KB）里 `message_type=50001` 的
+# cmd=500 通知带的是 {"command_type":14,...,"mute_read_badge_count_info":[...]}，
+# 属于红点/已读状态同步，不是聊天消息。这类帧一分钟能来好几条，必须不 dirty，
+# 否则每一帧都要去界面读一次。
+CONTROL_MESSAGE_TYPES = {50001}
 
 
 @dataclass(frozen=True)
@@ -405,6 +410,11 @@ def _normalize(response: dict, result: DecodeResult, limits: Limits) -> None:
         if not isinstance(parsed, dict):
             raise DecodeError("unknown_content_schema")
     data = parsed or {}
+    # 状态/命令类推送：有 cmd=500 的壳，但消息体不是聊天内容。
+    if msg_type in CONTROL_MESSAGE_TYPES or "command_type" in data:
+        result.diagnostics.append(f"control_message:{msg_type}")
+        result.dirty = False
+        return
     extra: dict[str, Any] = {
         "channel": "im", "route": "dm", "schema_commit": SCHEMA_COMMIT,
         "conversation_id": conv,
@@ -512,9 +522,10 @@ def decode_frame(payload: bytes | bytearray | memoryview | str, *,
         else:
             budget = _Budget(limits)
             frame = _wire(raw, budget)
-            for tag in (1, 2, 3, 4):
-                if _one(frame, tag, 0) is None:
-                    raise DecodeError("unknown_frame_schema")
+            # 真实帧里 1..4（seqid/logid/service/method）都出现，但不要写死：
+            # 只要认得出这是带信封的帧就往下走，缺哪个字段由后续解析兜。
+            if not any(_one(frame, tag, 0) is not None for tag in (1, 2, 3, 4)):
+                raise DecodeError("unknown_frame_schema")
             body = _one(frame, 8, 2, b"")
             headers = {}
             for kind, entry in frame.get(5, []):
