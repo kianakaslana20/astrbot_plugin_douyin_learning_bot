@@ -277,7 +277,7 @@
           "ask",
           "auto"
         ],
-        "hint": "off=只播报不动作；ask=刷完问一句，回 /dy do 才执行；auto=自动执行"
+        "hint": "off=只播报不动作；ask=分享仍要你点头，评论/点赞按各自开关直接发；auto=三类全自动"
       },
       "share_mode": {
         "type": "string",
@@ -369,6 +369,18 @@
         "default": 2,
         "hint": "0 = 不自动做（仍可用 /dy share、/dy comment 手动触发）"
       },
+      "comment_retry": {
+        "type": "int",
+        "description": "评论空回包重试次数",
+        "default": 2,
+        "hint": "抖音接口偶尔回空，重试几次；0 表示不重试"
+      },
+      "comment_retry_s": {
+        "type": "int",
+        "description": "评论重试首次等待（秒）",
+        "default": 20,
+        "hint": "之后每次翻倍；太小容易被风控"
+      },
       "action_dump": {
         "type": "bool",
         "description": "写操作失败时保存现场",
@@ -377,15 +389,15 @@
       },
       "auto_like": {
         "type": "bool",
-        "description": "自动点赞",
+        "description": "刷完自动点赞",
         "default": false,
-        "hint": "L2 级写操作，需要登录态，慎开（当前未接线）"
+        "hint": "打开后每轮刷完自动点赞（L2 写操作，需要登录态）；同样受上限与静默时段限制"
       },
       "auto_comment": {
         "type": "bool",
-        "description": "自动评论（旧开关，保留兼容）",
-        "default": false,
-        "hint": "现在用 action_mode 控制；这条不再单独生效"
+        "description": "刷完自动评论",
+        "default": true,
+        "hint": "打开后每轮刷完直接评论，不再等 /dy do；仍受每日评论上限与静默时段限制。action_mode=off 时不生效"
       },
       "enforce_allowlist": {
         "type": "bool",
