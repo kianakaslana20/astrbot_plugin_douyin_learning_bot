@@ -1,3 +1,23 @@
+## 0.11.1 —— 真机抓包回来改的：50001 不是消息
+
+0.11.0 的 protobuf 解析只有 synthetic fixture 背书。这一版是拿**真机抓到的帧**
+（`action_dump` 打开时落盘的 `ws_dumps/frames.jsonl`）回头校出来的：
+
+- **真实帧结构**（1.2 KB，frontier-im 收到）：`1=seqid 2=logid 3=service 4=method
+  5=headers 6=encoding(空) 7='pb' 8=payload`；payload 里 `1=cmd(500)`、`6=body`、
+  body 的 `500=NewMessageNotify`，其中 `5=MessageBody`。和钉住的第三方 schema 对得上。
+- **`message_type=50001` 是红点/已读状态同步**，不是聊天消息：它的 content 是
+  `{"command_type":14,...,"mute_read_badge_count_info":[...]}`。这类帧一分钟来好几条，
+  0.11.0 会把每一条都当成「有动静」→ 每一帧都去界面读一次。现在归为 control：
+  记诊断、不 dirty、不产生事件。
+- **信封判定放宽**：原来要求 `1..4` 字段全在，现在只要认得出是带信封的帧就往下走，
+  免得少一个字段就被判成未知帧。
+- 真实帧 fixture 只留在本地（`tests/_real_frames.txt` 已进 `.gitignore`，里面有本人 uid
+  和 `client_message_id`），测试文件在 fixture 缺失时自动 skip。
+
+实测：改完后同一段时间里 `事件守护(ws)` 轮次从「每帧一次」变成 **0**，
+4 条真实帧全部 `control_message:50001 / dirty=False`。
+
 ## 0.11.0 — 真的把推送解开了：protobuf 业务帧 + 评论区接入
 
 0.10.0 只是「看到 WS 上有动静就去读界面」。这一版直接解析推送里的业务帧，
