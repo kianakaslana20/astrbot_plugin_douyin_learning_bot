@@ -85,56 +85,176 @@ class Social:
         self._hook_page = None
 
     # ---------- 昵称 → uid 缓存 ----------
+    #
+    # 两个字段必须分开存：comment/publish 的 text_extra.user_id 只认**纯数字 uid**。
+    # 塞抖音号（形如 op111014722）时服务端不报错、评论照发，但 @ 等于没点 ——
+    # 表现为「评论发出去了，@ 是空的」。老缓存把两者混在同一个 str 里，脏过一次
+    # （yezheyue → op111014722），所以这里从根上拆成 uid / dy_id 两格。
+    UID_RE = re.compile(r"^\d{6,20}$")
 
-    def _load_uid_cache(self) -> dict[str, str]:
+    def _load_uid_cache(self) -> dict[str, dict]:
+        raw: dict = {}
         try:
             if self._uid_file.exists():
-                data = json.loads(self._uid_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    return {str(k): str(v) for k, v in data.items() if k and v}
+                raw = json.loads(self._uid_file.read_text(encoding="utf-8")) or {}
         except Exception as exc:  # noqa: BLE001
             logger.info(f"[social] uid 缓存读不出来（{exc}），当空的用")
-        return {}
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict] = {}
+        for key, val in raw.items():
+            name = str(key or "").strip()
+            if not name:
+                continue
+            if isinstance(val, dict):
+                uid = str(val.get("uid") or "").strip()
+                dy_id = str(val.get("dy_id") or "").strip()
+            else:                       # 老格式：一个字符串，分不清是 uid 还是抖音号
+                uid, dy_id = str(val or "").strip(), ""
+            if uid and not self.UID_RE.match(uid):
+                dy_id = dy_id or uid     # 不是纯数字 → 它是抖音号，别混进 uid
+                uid = ""
+            out[name] = {"uid": uid, "dy_id": dy_id}
+        return out
 
-    def _remember_uids(self, rows: list[dict]) -> None:
-        added = 0
-        for row in rows or []:
-            name = (row.get("name") or row.get("label") or "").strip()
-            uid = str(row.get("uid") or "").strip()
-            if name and uid and self._uid_cache.get(name) != uid:
-                self._uid_cache[name] = uid
-                added += 1
-        if not added:
-            return
+    def _save_uid_cache(self) -> None:
         try:
             self.dump_dir.mkdir(parents=True, exist_ok=True)
             self._uid_file.write_text(
                 json.dumps(self._uid_cache, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            logger.info(f"[social] 记住 {added} 个 uid（共 {len(self._uid_cache)} 个）")
         except Exception as exc:  # noqa: BLE001
             logger.info(f"[social] uid 缓存写不进去：{exc}")
 
-    def _uid_of(self, name: str) -> str:
+    def _remember_uids(self, rows: list[dict]) -> None:
+        added = 0
+        for row in rows or []:
+            name = (row.get("name") or row.get("label") or "").strip()
+            value = str(row.get("uid") or "").strip()
+            if not name or not value:
+                continue
+            slot = self._uid_cache.setdefault(name, {"uid": "", "dy_id": ""})
+            if self.UID_RE.match(value):
+                if slot.get("uid") != value:
+                    slot["uid"] = value
+                    added += 1
+            elif slot.get("dy_id") != value:
+                # 不是数字：按抖音号存，**绝不写进 uid**
+                logger.info(f"[social] 「{name}」给的 {value} 不是纯数字，按抖音号存")
+                slot["dy_id"] = value
+                added += 1
+        if added:
+            self._save_uid_cache()
+            logger.info(f"[social] 记住 {added} 条 uid/抖音号（共 {len(self._uid_cache)} 人）")
+
+    def _slot_of(self, name: str) -> dict:
         """精确 → 包含 → 被包含，跟面板按片段匹配昵称的思路一致。"""
         name = (name or "").strip()
         if not name:
-            return ""
+            return {}
         if name in self._uid_cache:
             return self._uid_cache[name]
-        for key, uid in self._uid_cache.items():
+        for key, slot in self._uid_cache.items():
             if name in key or key in name:
-                return uid
+                return slot
+        return {}
+
+    def _uid_of(self, name: str) -> str:
+        """只返回纯数字 uid；抖音号不从这里出来。"""
+        return str(self._slot_of(name).get("uid") or "")
+
+    def _dy_id_of(self, name: str) -> str:
+        return str(self._slot_of(name).get("dy_id") or "")
+
+    @staticmethod
+    def _looks_like_dy_id(text: str) -> bool:
+        """op111014722 / 自定义字母数字号 —— 抖音号，不是 uid。"""
+        t = (text or "").strip()
+        return bool(re.fullmatch(r"(?:op)?\d{8,}", t) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]{4,23}", t))
+
+    async def _im_search(self, page, kw: str) -> bool:
+        """在私信抽屉的搜索框里搜一个词。返回是否真的提交了搜索。"""
+        if not await self._open_im(page):
+            return False
+        box = None
+        for _ in range(10):
+            box = await self._rect(page, IM_SEARCH)
+            if self._is_displayed(box):
+                break
+            await page.wait_for_timeout(300)
+        if not self._is_displayed(box):
+            return False
+        await self._click_rect(page, box["x"] + box["w"] / 2, box["y"] + box["h"] / 2)
+        await page.wait_for_timeout(200)
+        try:
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.insert_text(kw)
+            await page.keyboard.press("Enter")
+        except Exception:  # noqa: BLE001
+            return False
+        await page.wait_for_timeout(2200)
+        return True
+
+    async def _uid_from_dy_id(self, page, dy_id: str) -> str:
+        """抖音号 → 数字 uid。只走页面里已经有的渠道，避免惊动人机验证。
+
+        能用的只有一条：私信抽屉的搜索结果（会话行里带 data-userid）。
+        搜不到就返回空串，调用方会退化成「只发评论、不 @」。
+        """
+        dy_id = (dy_id or "").strip()
+        if not dy_id:
+            return ""
+        try:
+            if not await self._im_search(page, dy_id):
+                return ""
+            rows = await page.evaluate(
+                """() => {
+                       const d = document.querySelector('[data-e2e="im-dialog"]') || document;
+                       return Array.from(d.querySelectorAll('[data-userid]')).map((a) => ({
+                           uid: a.getAttribute('data-userid'),
+                           name: (a.parentElement ? a.parentElement.innerText : '')
+                                   .replace(/\\s+/g, ' ').trim().slice(0, 40),
+                       }));
+                   }"""
+            ) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[social] 按抖音号 {dy_id} 反查 uid 失败：{exc}")
+            return ""
+        for row in rows:
+            uid = str(row.get("uid") or "")
+            name = str(row.get("name") or "")
+            # 只认「搜索结果里明写着这个抖音号」的那一行。
+            # 不校验就会踩更糟的坑：搜索没过滤时列表还是最近会话，
+            # 照第一个数字 uid 去填 → 评论 @ 到了完全不相干的人。
+            if not self.UID_RE.match(uid):
+                continue
+            if dy_id not in name and dy_id != name.strip():
+                continue
+            logger.info(f"[social] 抖音号 {dy_id} 反查到 uid={uid}（{name}）")
+            return uid
+        logger.info(f"[social] 抖音号 {dy_id} 没反查到数字 uid（不猜，交给上层降级）")
         return ""
 
     async def resolve_uid(self, page, name: str) -> str:
-        """先查缓存；没有就去视频页 hover 分享面板刮一次。"""
+        """先查缓存 → 视频页刮分享面板 → 按抖音号反查。只认纯数字 uid。"""
         uid = self._uid_of(name)
         if uid:
             return uid
         rows = await self._share_rows(page)
         self._remember_uids(rows)
-        return self._uid_of(name)
+        uid = self._uid_of(name)
+        if uid:
+            return uid
+        dy_id = self._dy_id_of(name) or (name if self._looks_like_dy_id(name) else "")
+        if dy_id:
+            uid = await self._uid_from_dy_id(page, dy_id)
+            if uid:
+                slot = self._uid_cache.setdefault(name, {"uid": "", "dy_id": dy_id})
+                slot["uid"] = uid
+                self._save_uid_cache()
+        return uid
 
     # ---------- 基础工具 ----------
 
@@ -393,11 +513,16 @@ class Social:
             if code == 0 and res.get("cid"):
                 return True, res["cid"], ""
             if code == 8:
-                return False, "", "未登录，先 /dy login"
+                raw8 = str(res.get("raw") or "").strip()
+                return False, "", f"会话作废（code=8），先 /dy login" + (f"｜原文 {raw8[:300]}" if raw8 else "")
             if code == 4 or code == 5:
-                return False, "", "被拦了（内容可能不合适）"
+                raw4 = str(res.get("raw") or "").strip()
+                return False, "", f"被拦了（code={code}）" + (f"｜原文 {raw4[:300]}" if raw4 else "")
             empty = res.get("status") == 200 and not str(res.get("raw") or "").strip()
-            last = "被限流了（空回包）" if empty else f"接口返回 code={code}"
+            raw = str(res.get("raw") or "").strip()
+            # 抖音回了什么就原样带出来，别吞 —— 排查时全靠这一段
+            tail = f"｜原文 {raw[:400]}" if raw else "｜原文（空）"
+            last = "被限流了（空回包）" if empty else f"接口返回 code={code}{tail}"
             if empty and i + 1 < tries:
                 logger.info("[social] 评论被限流，%ss 后重试（%s/%s）", gap, i + 1, tries)
                 await page.wait_for_timeout(gap * 1000)
@@ -629,8 +754,23 @@ class Social:
                 if uid:
                     pairs.append((name, uid))
                     missing.remove(name)
+        # 还差人的，退一步按抖音号反查（只认纯数字 uid）
+        for name in list(missing):
+            dy_id = self._dy_id_of(name) or (name if self._looks_like_dy_id(name) else "")
+            if not dy_id:
+                continue
+            uid = await self._uid_from_dy_id(page, dy_id)
+            if uid:
+                slot = self._uid_cache.setdefault(name, {"uid": "", "dy_id": dy_id})
+                slot["uid"] = uid
+                self._save_uid_cache()
+                pairs.append((name, uid))
+                missing.remove(name)
         if not pairs:
-            return False, "", f"拿不到这些人的 uid（{', '.join(missing) or '菜单空'}）"
+            return False, "", f"拿不到这些人的纯数字 uid（{', '.join(missing) or '菜单空'}）"
+        if missing:
+            # 只 @ 到一部分没有意义：宁可不 @，也不能发一条「看起来 @ 了、其实没点到人」的评论
+            return False, "", f"这些人只有抖音号、反查不到纯数字 uid：{', '.join(missing)}"
         body = text.rstrip()
         extra: list[dict] = []
         used: list[str] = []
@@ -888,20 +1028,25 @@ class Social:
 
         # 带 @ 的也先走接口：能拿 cid（可回读、可删），@ 由 text_extra 表达，
         # 实测服务端会把 sec_uid 补全。界面那条路留着兜底。
-        # uid 已经在缓存里就不用开视频页了 —— 少一次导航，也绕开「打不开的视频」。
-        if all(self._uid_of(m) for m in mentions):
-            ok_api, cid_api, why_api = await self._api_comment_with_at(
-                page, aweme_id, text, mentions
+        #
+        # 但 uid 必须是**纯数字**。只知道抖音号、又反查不到时，不拼这个 @：
+        # text_extra 里塞抖音号不会报错，评论照发、@ 是空的 —— 比明说没 @ 上更糟。
+        # 那就退化成「只发普通评论」，并把原因写进回执，让人知道该去补 uid。
+        ok_api, cid_api, why_api = await self._api_comment_with_at(
+            page, aweme_id, text, mentions
+        )
+        if ok_api:
+            return ActionResult(
+                True,
+                "comment",
+                "评论",
+                f"已发布（cid={cid_api}）；@ 已带上（{', '.join(mentions)}）",
             )
-            if ok_api:
-                return ActionResult(
-                    True,
-                    "comment",
-                    "评论",
-                    f"已发布（cid={cid_api}）；@ 已带上（{', '.join(mentions)}）",
-                )
-        else:
-            why_api = "uid 还没缓存，需要开视频页刮分享面板"
+        note = f"；@ 没带上（{why_api}），改成只发评论"
+        ok_plain, cid_plain, why_plain = await self._comment_api(page, aweme_id, text)
+        if ok_plain:
+            return ActionResult(True, "comment", "评论", f"已发布（cid={cid_plain}）{note}")
+        why_api = f"{why_api}；退回普通评论也没成：{why_plain}"
         logger.info("[social] 接口带@失败（%s），退回界面路径", why_api)
         if not await self._open_video(page, aweme_id):
             return ActionResult(
