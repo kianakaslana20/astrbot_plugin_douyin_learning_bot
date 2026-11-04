@@ -298,6 +298,22 @@
 - 私信白名单 `dm_allow` 与分享/@ 白名单分开：分享错人只是尴尬，私信发错人是骚扰。
 
 
+## 0.10.0
+
+**从「定时轮询」改成「事件触发 + 模型自己判断」。** 起因是：私信要等最多 60 秒、刷视频只看时间不看内容。
+
+- 新增 `douyin/im.py::ImWatcher`：挂 `page.on("websocket")` 监听 `frontier-im` / `frontier-pc`，
+  把非 `hi` 心跳帧当「有动静」的信号。实测空闲期只有心跳，业务帧是 protobuf —— 所以不解包，只当信号。
+- 新增 `douyin/agent.py`：`handle_douyin_event()` 返回 `{reply, text, reason}`，
+  `judge_round()` 返回 `{run, take, reason}`；人设取 AstrBot 人格、模型复用主核心 provider。
+  没有可用模型时返回 `model:false`，调用方退回旧规则路径（不会因为模型挂了就不回话）。
+- 私信守护重写：WS 信号即时读 + WS 静默 5 分钟退回 `poll_fallback_min` 兜底轮询，日志标 `(ws)` / `(poll)`。
+- 新增 `dm_judge` 表：event_id / type / from_nick / content / decision / reason / created_at。
+- 自主刷：`_auto_think_loop` 每 5 分钟看条件（超过 `loop_interval_min` ／有人分享评论 ／你最近 30 分钟有互动），
+  问过模型才排任务；受 `auto_rounds_per_day`、`auto_items_per_day` 两道预算约束。
+- `dm_targets` 里的人不再受私信条数限制（静默时段仍然拦），别人的评论同一 uid 只回一条。
+- 顺手修：`_handle_dm_share_event` 调 `pipeline._handle_one` 少传了 score 参数。
+
 ## 0.9.7 — 2026-11-04
 
 **能主动发私信了。**
