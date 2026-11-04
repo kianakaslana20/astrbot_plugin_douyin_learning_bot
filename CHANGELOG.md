@@ -1,3 +1,25 @@
+## 0.11.3 —— 自己发出去的话推回来，不能当新私信
+
+0.11.2 把解出来的私信提升成条目之后，紧跟着一个会被真机踩到的问题：**自己发出去的消息
+也会被推回来一条**，`sender` 是自己。当成新私信处理，就会自己回自己，回出来的又推回来 ——
+往返回不停。查库能看到这条：`im:0:1:4330304429101319:4330304429101319:7704391562680272442`
+（会话两侧是同一个 uid）。
+
+### 改
+
+- 新增 `_ws_self_echo(evt, who)`，三条判据任一命中就当回声，只落 `ws_evidence`，
+  `inbox_done(reason=self_echo)`，不提升、不回：
+  1. `conversation_id` 两侧是同一个 uid（自聊会话）；
+  2. 解出来的名字在 `dm_self_names` 里；
+  3. `from_uid` 跟 `dm_self_names` 里某个名字在 uid 缓存中的 uid 相同。
+- 界面那条链路本来就有 `sent_lookup` 回声表兜着，这次补的是**协议层这条新链路**。
+
+### 测试
+
+- 新增 `test_own_message_pushed_back_is_not_promoted`、
+  `test_self_name_without_conversation_id_still_blocked`。
+- `tests/` **82 项全过**；老回归 38 / 23 / 23 / 22 / 17 全绿。
+
 ## 0.11.2 —— 解出来的私信真的会回：WS 事件提升成一等条目
 
 0.11.1 只做到「解对」，还差一步：解出来的私信只落了一条 `ws_evidence` 证据就没了，
