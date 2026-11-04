@@ -263,6 +263,7 @@ class Settings:
     rate_share_per_day: int = 10      # 每天最多分享几次
     rate_like_per_day: int = 30       # 每天最多点几个赞
     rate_dm_per_hour: int = 6         # 每小时最多回几条私信（留给 0.9.x）
+    rate_summary_per_day: int = 20    # 每天最多写几份私信视频总结
     quiet_hours: str = ""             # 例 "01:00-08:00"，这段时间不发任何东西
     pending_ttl_hours: int = 12       # ask 模式攒下的待执行动作，超过这么久作废
     keep_days: int = 30               # 记录与临时文件保留多少天，0 = 不清
@@ -374,6 +375,7 @@ class Settings:
             rate_share_per_day=_as_int(ac.get("rate_share_per_day"), 10, 0, 500),
             rate_like_per_day=_as_int(ac.get("rate_like_per_day"), 30, 0, 999),
             rate_dm_per_hour=_as_int(ac.get("rate_dm_per_hour"), 6, 0, 500),
+        rate_summary_per_day=_as_int(ac.get("rate_summary_per_day"), 20, 0, 500),
             quiet_hours=_as_str(ac.get("quiet_hours"), ""),
             pending_ttl_hours=_as_int(ac.get("pending_ttl_hours"), 12, 0, 168),
             keep_days=_as_int(ac.get("keep_days"), 30, 0, 3650),
