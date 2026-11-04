@@ -495,6 +495,36 @@
         "description": "每次最多回几轮（1~10）",
         "default": 2,
         "hint": "一轮扫描里同一个人最多读到几条消息、最多回几次。"
+      },
+      "dm_chat_no_limit": {
+        "type": "text",
+        "description": "不限次数的私聊对象（昵称，逗号分隔）",
+        "default": "",
+        "hint": "填在这的人私聊不受「私信每小时」上限约束，可以一直聊。留空 = 所有人都按上限走。"
+      },
+      "dm_chat_poll_s": {
+        "type": "int",
+        "description": "私信守护间隔（秒，0 = 关）",
+        "default": 0,
+        "hint": "开成 60 就是每分钟看一次私信。只读私信、不碰提醒。设了它私聊才接近实时，代价是浏览器基本常开。"
+      },
+      "dm_chat_history": {
+        "type": "int",
+        "description": "带几句上下文（0~20）",
+        "default": 6,
+        "hint": "回复时把它最近说过的几句一起给模型，语气才不会跳。"
+      },
+      "dm_identity": {
+        "type": "text",
+        "description": "同一身份映射：抖音昵称=QQ号（一行一条）",
+        "default": "",
+        "hint": "比如 大肥鱼Yume=1931855425。填了之后，抖音私聊里她会去读这个 QQ 号在 AstrBot 里聊过的内容，接得上。"
+      },
+      "dm_self_names": {
+        "type": "text",
+        "description": "自聊会话（自己跟自己）的昵称",
+        "default": "",
+        "hint": "抖音里私聊自己那个会话，两边都显示成自己发的。填上昵称（如 大肥鱼Yume）后，插件会把「不是它自己发过的」那些当作你在说，就能一对一句地聊。"
       }
     }
   },
