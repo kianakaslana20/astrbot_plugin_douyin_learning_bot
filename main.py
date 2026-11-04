@@ -1156,6 +1156,12 @@ class DouyinLearningBot(Star):
             # 界面里能对上（哪怕对上多条）就不另外造，避免同一条私信回两遍。
             kind_map = {"dm": "dm_text", "share": "dm_share"}
             kind = kind_map.get(str(evt.get("type")))
+            if self._ws_self_echo(evt, who):
+                # 自己发出去的话也会被推回来一条；当新消息处理就会自己跟自己无限对话。
+                await self.store.inbox_add("ws_evidence", str(evt.get("event_id") or evt.get("raw_frame_id")),
+                    src="ws", payload=json.dumps(evt, ensure_ascii=False))
+                await self.store.inbox_done("ws_evidence", str(evt.get("event_id") or evt.get("raw_frame_id")), "self_echo")
+                continue
             if not candidates and kind and who and str(evt.get("content") or "").strip():
                 entry = Entry(kind=kind, key=str(evt.get("event_id") or ""), src=who,
                     who=who, text=str(evt["content"]).strip(), when="",
@@ -1240,6 +1246,32 @@ class DouyinLearningBot(Star):
         finally:
             for evt in raw:
                 watcher.release(evt)
+
+    def _ws_self_echo(self, evt: dict, who: str) -> bool:
+        """这条推送是不是我自己发出去、又被服务端推回来的。
+
+        自己的消息 sender 也是「我」，当成新私信处理就会自己回自己，回出来的又推回来。
+        三条判据任一命中就算回声：会话两侧是同一个人、发送者是 dm_self_names 里的名字、
+        或者 from_uid 跟自聊名字在 uid 缓存里的 uid 相同。
+        """
+        extra = evt.get("extra") or {}
+        conv = str(extra.get("conversation_id") or "")
+        parts = [p for p in conv.split(":") if p]
+        if len(parts) >= 4 and parts[-1] == parts[-2]:
+            return True
+        raw = getattr(self.settings, "dm_self_names", "") or ""
+        names = [x.strip() for x in raw.replace("，", ",").replace("、", ",").split(",") if x.strip()]
+        if not names:
+            return False
+        if who and any(a == who or a in who or who in a for a in names):
+            return True
+        uid = str(evt.get("from_uid") or "")
+        cache = getattr(self.social, "_uid_cache", {}) or {}
+        for a in names:
+            slot = cache.get(a)
+            if isinstance(slot, dict) and uid and str(slot.get("uid") or "") == uid:
+                return True
+        return False
 
     def _ws_mark(self, who: str, text: str) -> None:
         seen = getattr(self, "_ws_dm_seen", None)
