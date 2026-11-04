@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field
 
 from astrbot.api import logger
@@ -51,6 +53,8 @@ class Entry:
     def describe(self) -> str:
         if self.kind == "dm_share":
             head = f"私信 · {self.who or '有人'} 发来一条视频"
+        elif self.kind == "dm_text":
+            head = f"私信 · {self.who or '有人'} 说"
         else:
             head = f"评论提醒 · {self.who or '有人'} 在评论里 @ 了你"
         if self.text:
@@ -97,8 +101,15 @@ class Inbox:
         convs = await self.dm.conversations(page)
         if not convs:
             return []
-        # 只看「预览里写着分享」的会话，别的会话没必要点进去
-        targets = [c for c in convs if c.looks_share][:max_conversations]
+        # 分享会话一定要看；开了日常聊天时，白名单里的普通会话也要看
+        chat_on = bool(getattr(self.settings, "dm_chat_enabled", False))
+        chat_allow = _names(getattr(self.settings, "dm_chat_allow", "") or "")
+        targets = [c for c in convs if c.looks_share]
+        if chat_on:
+            for c in convs:
+                if c not in targets and _allowed(c.name, chat_allow):
+                    targets.append(c)
+        targets = targets[:max_conversations]
         out: list[Entry] = []
         for conv in targets:
             if not await self.dm.open_conversation(page, conv.name):
@@ -117,6 +128,18 @@ class Inbox:
                         src=conv.name,
                     )
                 )
+            if chat_on and _allowed(conv.name, chat_allow):
+                for m in _incoming_texts(msgs, limit=max_cards):
+                    out.append(
+                        Entry(
+                            kind="dm_text",
+                            key="dt:" + _digest(conv.name + "|" + m.text[:60]),
+                            who=conv.name,
+                            text=m.text,
+                            when=conv.when,
+                            src=conv.name,
+                        )
+                    )
         return out
 
     async def collect_mentions(self, page) -> list[Entry]:
@@ -166,3 +189,34 @@ def aweme_of(text: str) -> str:
 
 
 __all__ = ["Entry", "Inbox", "aweme_of"]
+
+
+def _names(spec: str) -> list[str]:
+    if not spec:
+        return []
+    for sep in ("，", "、", ";", "；", "/", "|"):
+        spec = spec.replace(sep, ",")
+    return [x.strip() for x in spec.split(",") if x.strip()]
+
+
+def _allowed(name: str, allow: list[str]) -> bool:
+    """白名单为空 = 谁都不回（日常聊天比分享敏感，宁可不动）。"""
+    if not allow:
+        return False
+    return any(a == name or a in name or name in a for a in allow)
+
+
+def _incoming_texts(msgs: list, limit: int = 3) -> list:
+    """只取别人发来的、有内容的纯文本，最后 limit 条。"""
+    out = []
+    for m in msgs:
+        if m.kind != "text" or m.mine:
+            continue
+        if not (m.text or "").strip():
+            continue
+        out.append(m)
+    return out[-limit:]
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:16]
