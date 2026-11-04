@@ -1437,3 +1437,58 @@ if dy_id not in name and dy_id != name.strip():
   在这台机器上会挂住（fetch 不返回），暂不接
 - 知道昵称、既不是好友也不在会话里的人，目前只能「不 @」，回执里会说清楚
 
+## 24. 文案层：让人格写评论（v0.8.5）
+
+### 24.1 模板为什么会露馅
+
+```python
+tpl = "看完记一笔：{summary}"
+text = tpl.format(summary=analysis.summary[:60])
+```
+
+- 句式固定：几十条评论一个骨架，翻主页就能看出来
+- `summary` 是给"知识库"用的压缩摘要，不是人会说的话（信息密度高、没有立场）
+- 同一条视频被分享到不同群时前后文案一样
+
+评论区要的不是"摘要"，是**一个人在特定一条视频下面的一句话**，所以需要看内容 + 有立场。
+
+### 24.2 取人格与模型
+
+```python
+pm = context.persona_manager
+persona = pm.get_persona_v3_by_id(voice_persona) if voice_persona else await pm.get_default_persona_v3(umo)
+prov = context.get_using_provider(umo)          # 或 await context.get_using_provider_async(umo)
+resp = await prov.text_chat(prompt=..., system_prompt=persona["prompt"] + 规则, image_urls=[...])
+```
+
+- 人格是 `Personality`（TypedDict），字段 `prompt / name / begin_dialogs / …`，只取 `prompt`
+- `get_default_persona_v3(umo)` 会按会话配置解析默认人格，所以"QQ 上用什么人格，评论区就什么人格"
+- `image_urls` 支持本地路径/`file://`/http，内部走 `resolve_image_ref_to_base64_data` 转 data URL
+  （实测裸路径、`file:///`、`file:////` 三种都能解析）
+
+### 24.3 自检与重写
+
+```
+生成 → 清洗（剥引号/剥 @/压成一行）
+     → check()：空？命中禁词？多行？像列表？
+        ├─ 干净 → 返回
+        └─ 不干净 → 带「重写一句更像人话的」再要一次
+                   ├─ 干净 → 返回
+                   └─ 仍不干净 → 返回空串（上层退模板）
+```
+
+禁词表分两段：内置（首先/其次/再次/综上/总之/值得一提的是/这个视频/内容丰富/干货满满/
+值得一看/展现了/体现了…）+ 用户在 `voice_banned` 里加的。内置那份是"AI 腔"特征词，
+用户那份通常是"别让我说这个词"。
+
+### 24.4 为什么保留模板
+
+模型挂掉、超时、被限流时，评论还是要发 —— 模板是**兜底**而不是默认。
+`voice_enabled=false` 时行为跟 0.8.4 完全一致，谁不喜欢模型写就关掉。
+
+### 24.5 与"人味"还差什么
+
+- 没有随机延迟（现在发出去是"看完立刻评论"，真人很少这样）——排进 0.9.x
+- 没有对同一条视频的"第二次评论"策略，也不该有
+- 语气只在 prompt 层，没有 few-shot 样本；真正稳的做法是把用户自己写过的评论塞 3 条进去
+
