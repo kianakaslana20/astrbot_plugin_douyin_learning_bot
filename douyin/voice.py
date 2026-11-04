@@ -347,13 +347,23 @@ class Voice:
         their: str,
         history: list[str] | None = None,
         umo: str = "",
+        memory: str = "",
     ) -> str:
-        """私信里回一句。语气跟着人格走，不套客服腔。"""
+        """私信里回一句。语气跟着人格走，不套客服腔。
+
+        memory 是跨平台背景（QQ 上聊过什么、抖音上刚说过什么），塞进 system，
+        不进 prompt —— 免得模型把背景当成"对方刚说的话"去回答。
+        """
         max_chars = self._max_chars(60)
         persona = await self.persona_prompt(umo)
         system = (persona + "\n\n" if persona else "") + _CHAT_RULES.format(
             max_chars=max_chars
         )
+        if memory:
+            system += (
+                "\n\n【你记得的事】下面是你和这个人的过往，用来自然接话，"
+                "不要复述、不要提「我查了记录」：\n" + memory[:1500]
+            )
         parts = []
         if history:
             parts.append("刚才聊的：\n" + "\n".join(history[-6:]))
