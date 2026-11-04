@@ -11,6 +11,7 @@ wss 长连接，纯 HTTP 拼不出来。而界面上这些东西都摆着：会�
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +43,87 @@ def _strip_when(text: str) -> str:
             break
         name = cut
     return name
+
+class ImWatcher:
+    """监听抖音 IM 的 WebSocket 帧，只当「有动静」的信号用。
+
+    实测：`wss://frontier-im.douyin.com/ws/v2` 平时每十几秒发一帧文本 `hi`
+    （心跳）；真有人发消息时会有二进制帧（protobuf，不解析）。所以这里只做两件事：
+    认出「不是心跳的帧」→ 置脏标记；记录最后一次收到信号的时间。
+    脏标记触发一次界面读取（比解析 protobuf 稳，也比纯轮询快）。
+    """
+
+    HEARTBEATS = (b"hi", b"", "hi", "")
+
+    def __init__(self, page):
+        self.page = page
+        self.frames = 0
+        self.signals = 0
+        self.last_signal = 0.0
+        self.last_heartbeat = 0.0
+        self.dirty = False
+        self.urls: list[str] = []
+        self.last_frame = ""
+        try:
+            page.on("websocket", self._on_ws)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------------------------------------------------------------- 内部
+    def _on_ws(self, ws) -> None:
+        url = getattr(ws, "url", "") or ""
+        if "frontier-im" not in url and "frontier-pc" not in url:
+            return
+        self.urls.append(url[:80])
+        try:
+            ws.on("framereceived", self._on_frame)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_frame(self, payload) -> None:
+        self.frames += 1
+        now = time.time()
+        if payload in self.HEARTBEATS:
+            self.last_heartbeat = now
+            return
+        size = len(payload) if hasattr(payload, "__len__") else 0
+        if isinstance(payload, str) and len(payload) < 12:
+            self.last_heartbeat = now
+            return
+        if size and size < 32:
+            # 短帧多半还是控制帧
+            self.last_heartbeat = now
+            return
+        self.signals += 1
+        self.last_signal = now
+        self.dirty = True
+        try:
+            head = payload[:48] if isinstance(payload, (bytes, bytearray)) else str(payload)[:48]
+            self.last_frame = repr(head)
+        except Exception:  # noqa: BLE001
+            self.last_frame = ""
+
+    # ---------------------------------------------------------------- 对外
+    def take(self) -> bool:
+        """取走脏标记：这次是真有动静吗。"""
+        got, self.dirty = self.dirty, False
+        return got
+
+    def alive(self, silent_s: float = 300.0) -> bool:
+        """WS 还活着吗（最近 silent_s 秒内收到过任何帧）。"""
+        last = max(self.last_heartbeat, self.last_signal, 0.0)
+        return last > 0 and (time.time() - last) < silent_s
+
+    def stats(self) -> dict:
+        return {
+            "frames": self.frames,
+            "signals": self.signals,
+            "age_s": round(time.time() - self.last_signal, 1) if self.last_signal else -1,
+            "alive": self.alive(),
+            "conns": len(self.urls),
+            "last_frame": self.last_frame,
+        }
+
 
 @dataclass
 class Conversation:
