@@ -220,6 +220,7 @@ class DouyinLearningBot(Star):
         self._last_user_at = 0.0
         self.inbox.sent_lookup = self.memory.recent_me
         self._pending: list[tuple] = []
+        self._pending_kinds: set[str] = set()
         self._pending_at: float = 0.0
 
         self._ready = False
@@ -1080,6 +1081,12 @@ class DouyinLearningBot(Star):
                     logger.info("事件守护：已挂 WS 监听（导航前）")
                 if "douyin.com" not in (page.url or ""):
                     await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=45000)
+                if not await self._dm_logged_in():
+                    # 没登录时点「消息」只会弹出「登录后即可查看私信消息」，
+                    # 以前这里会默默试四轮再放弃，看着像插件坏了 —— 直接叫人扫码。
+                    await self._dm_login_notice()
+                    await asyncio.sleep(60)
+                    continue
                 if not getattr(self, "_dm_warmed", False):
                     # Snapshot old DOM only; queued pushes remain available for the next turn.
                     await self._one_event_round("baseline")
@@ -1100,6 +1107,42 @@ class DouyinLearningBot(Star):
             except Exception as exc:
                 logger.warning("事件守护异常：%s", exc)
                 await asyncio.sleep(15)
+
+    async def _dm_logged_in(self) -> bool:
+        """私信/事件守护用的轻量登录检查：只看当前会话，不主动开浏览器。"""
+        try:
+            return bool(await self.browser.logged_in(launch=False))
+        except Exception as exc:  # noqa: BLE001
+            logger.info("私信守护：登录态没查出来（%s），先当已登录继续", type(exc).__name__)
+            return True
+
+    async def _dm_login_notice(self) -> None:
+        """掉登录时叫一次人：把窗口搬上来 + 发二维码，10 分钟内只叫一次。"""
+        if not getattr(self.settings, "notify_login", True):
+            return
+        now = time.time()
+        if now - self._login_notice_at < 600:
+            return
+        self._login_notice_at = now
+        logger.warning("私信守护：抖音没登录，私信读不到，正在叫人扫码")
+        try:
+            if getattr(self.settings, "window_on_login", True):
+                await self.browser.show_window()
+        except Exception:  # noqa: BLE001
+            pass
+        qr: Path | None = None
+        try:
+            if getattr(self.settings, "login_qr", True):
+                qr = await self.browser.login_qr(self.work_dir / "login_qr.png")
+        except Exception as exc:  # noqa: BLE001
+            logger.info("私信守护：截二维码没成功（%s）", type(exc).__name__)
+        tip = (
+            "抖音掉登录了，私信和评论都读不到。\n"
+            "浏览器窗口我摆到桌面上了，点右上角「登录」扫码（窗口里的码会自己刷新），"
+            "下面这张图也能扫，大约 1 分钟过期。\n"
+            "扫完不用回话，我每分钟看一眼，登录上了自己接着干。"
+        )
+        await self._ask_help(tip, qr, getattr(self.settings, "current_umo", "") or "")
 
     async def _wait_signal(self, watcher, timeout_s: int) -> bool:
         try:
@@ -1239,7 +1282,16 @@ class DouyinLearningBot(Star):
                     skipped += 1
                     why.append(type(exc).__name__)
                     await self.store.inbox_done(e.kind, e.key, "error:" + type(exc).__name__)
-                    logger.warning("事件处理失败(%s): %s", source, exc)
+                    stack = ""
+                    try:
+                        import traceback
+                        stack = traceback.format_exc()
+                        with open(self.data_dir / "event_errors.log", "a", encoding="utf-8") as fh:
+                            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {source} {e.kind}:\n{stack}\n")
+                    except Exception:
+                        stack = ""
+                    logger.warning(f"事件处理失败({source}, {e.kind}): {type(exc).__name__}: {exc}"
+                                   + ((" | " + stack.strip().splitlines()[-1][:160]) if stack else ""))
             logger.info("事件守护(%s)：解码 %s 条，读到 %s 条，新 %s 条，模型判断 reply %s 条，发出 %s 条，跳过 %s 条；%s",
                         source, len(raw), len(entries), len(fresh), getattr(self, "_event_judged_reply", 0),
                         replied, skipped, "；".join(why[:5]) or "无")
@@ -1795,8 +1847,18 @@ class DouyinLearningBot(Star):
         if total or removed:
             logger.info("清理保留期外的记录：%s，文件 %d 个", stats, removed)
 
-    async def _do_actions(self, pairs: list[tuple]) -> list[str]:
-        """对已分析的视频执行分享 + 评论，返回给人看的回执行。"""
+    async def _do_actions(self, pairs: list[tuple], kinds: set[str] | None = None) -> list[str]:
+        """对已分析的视频执行点赞/分享/评论，返回给人看的回执。
+
+        `kinds` 为 None 表示三种都做；给了就只做里面列的（`like` / `share` / `comment`），
+        用于「评论自动发、分享仍要问」这种按种类放行的场景。
+        """
+        want = None if kinds is None else {str(k).lower() for k in kinds}
+        do_like = want is None or "like" in want
+        do_share = want is None or "share" in want
+        do_comment = want is None or "comment" in want
+        if not (do_like or do_share or do_comment):
+            return []
         lines: list[str] = []
         if getattr(self.settings, "rate_enabled", True) and self.limits.in_quiet_hours(
             getattr(self.settings, "quiet_hours", "") or ""
@@ -1805,7 +1867,7 @@ class DouyinLearningBot(Star):
         budget = max(0, self.settings.max_actions_per_round)
         for item, analysis in pairs[:budget]:
             # 点赞（最低风险的那一档，先做）
-            if self.settings.auto_like and not await self.store.acted(
+            if do_like and not await self.store.acted(
                 item.aweme_id, "like", "digg"
             ):
                 why = await self.limits.check_async("like", self.settings)
@@ -1821,8 +1883,10 @@ class DouyinLearningBot(Star):
                     lines.append(f"　{res}")
                     await self._human_pause()
             # 分享
-            wanted, _rejected = self.settings.check_targets(
-                list(self.settings.share_allowlist), kind="share"
+            wanted, _rejected = (
+                self.settings.check_targets(list(self.settings.share_allowlist), kind="share")
+                if do_share
+                else ([], [])
             )
             todo = [t for t in wanted if not await self.store.acted(item.aweme_id, "share", t)]
             why_share = await self.limits.check_async("share", self.settings) if todo else ""
@@ -1840,7 +1904,7 @@ class DouyinLearningBot(Star):
                     lines.append(f"　{res}")
                 await self._human_pause()
             # 评论
-            text = await self._comment_text(item, analysis)
+            text = await self._comment_text(item, analysis) if do_comment else ""
             mentions, _blocked = self.settings.check_targets(
                 list(self.settings.mention_allowlist), kind="mention"
             )
@@ -1857,22 +1921,51 @@ class DouyinLearningBot(Star):
                 await self._human_pause()
         return lines
 
+    def _auto_kinds(self) -> set[str]:
+        """这一轮不用问、直接做的动作种类。
+
+        `action_mode` 是总闸门：`off` 一律不动；`auto` 三种都自动；`ask` 时再看单项
+        开关 —— `auto_comment`（评论）/ `auto_like`（点赞）勾了就自己发，剩下的
+        （分享）仍然推给用户确认。「刷完自动评论」走的就是这条。
+        """
+        mode = (getattr(self.settings, "action_mode", "off") or "off").lower()
+        if mode == "off":
+            return set()
+        if mode == "auto":
+            return {"like", "share", "comment"}
+        kinds: set[str] = set()
+        if getattr(self.settings, "auto_comment", False):
+            kinds.add("comment")
+        if getattr(self.settings, "auto_like", False):
+            kinds.add("like")
+        return kinds
+
     async def _auto_actions(self, result: RoundResult) -> str:
-        """按 action_mode 决定要不要动真格；返回要追加到简报后面的文字。"""
-        mode = self.settings.action_mode
+        """按 action_mode + 单项开关决定要不要动真格；返回要追加到简报后面的文字。"""
+        mode = (getattr(self.settings, "action_mode", "off") or "off").lower()
         if mode == "off" or not result.analyzed:
             return ""
-        if mode == "ask":
+        auto = self._auto_kinds()
+        rest = {"like", "share", "comment"} - auto
+        if mode == "ask" and rest:
             self._pending = result.analyzed[: max(1, self.settings.max_actions_per_round)]
             self._pending_at = time.time()
-            return "\n\n这条要分享/评论吗？回 /dy do 执行，或 /dy do 跳过"
-        try:
-            lines = await self._do_actions(result.analyzed)
-        except HumanVerifyNeeded:
-            raise                      # 交给 _run_job：搬窗口、叫人、验过再重试
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("写操作失败：%s", exc)
-            return f"\n\n写操作失败：{exc}"
+            self._pending_kinds = rest
+        lines: list[str] = []
+        if auto:
+            try:
+                lines = await self._do_actions(result.analyzed, kinds=auto)
+            except HumanVerifyNeeded:
+                raise                  # 交给 _run_job：搬窗口、叫人、验过再重试
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("写操作失败：%s", exc)
+                return f"\n\n写操作失败：{exc}"
+        if mode == "ask" and rest:
+            todo = "/".join(sorted(rest))
+            tail = f"\n\n还有 {todo} 没做：回 /dy do 执行，或 /dy do 跳过"
+            if not lines:
+                return tail
+            return "\n\n写操作回执：\n" + "\n".join(lines) + tail
         if not lines:
             return ""
         return "\n\n写操作回执：\n" + "\n".join(lines)
@@ -2519,6 +2612,7 @@ class DouyinLearningBot(Star):
             first = args[1].lower() if len(args) > 1 else ""
             if first in {"跳过", "skip", "取消", "cancel", "no"}:
                 self._pending = []
+                self._pending_kinds = set()
                 yield event.plain_result("已取消这轮写操作")
                 return
             if not self._pending:
@@ -2545,8 +2639,10 @@ class DouyinLearningBot(Star):
                 return
             self._pending = []
             self._pending_at = 0.0
-            yield event.plain_result(f"开始执行 {len(pairs)} 条视频的分享/评论…")
-            lines = await self._do_actions(pairs)
+            kinds = getattr(self, "_pending_kinds", None) or {"like", "share", "comment"}
+            self._pending_kinds = set()
+            yield event.plain_result(f"开始执行 {len(pairs)} 条视频的{'/'.join(sorted(kinds))}…")
+            lines = await self._do_actions(pairs, kinds=kinds)
             yield event.plain_result("\n".join(lines) or "没有需要执行的（这些视频可能都做过了）")
             dm_lines = await self._dm_flush(event.unified_msg_origin)
             if dm_lines:
