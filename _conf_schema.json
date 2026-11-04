@@ -459,6 +459,12 @@
         "description": "私信：每小时最多回几条",
         "hint": "私信回复的节奏是 0.9.x 的功能用的；先在这里定好上限。"
       },
+      "rate_summary_per_day": {
+        "type": "int",
+        "description": "总结：每天最多写几条（0 = 不写）",
+        "default": 20,
+        "hint": "私信分享来的视频，写一份像人写的总结要跑一遍转写+读图。这条预算就是成本闸门。"
+      },
       "quiet_hours": {
         "type": "string",
         "default": "",
