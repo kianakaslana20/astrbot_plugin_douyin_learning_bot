@@ -42,6 +42,7 @@ try:  # 正常情况：被 AstrBot 当作 data.plugins.<name>.main 加载
     from .douyin.social import ActionResult, Social
     from .douyin.store import Store
     from .douyin.understanding import Understander
+    from .douyin.voice import Voice
 except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录塞进 sys.path
     import sys
 
@@ -60,6 +61,7 @@ except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录
     from douyin.social import ActionResult, Social  # type: ignore
     from douyin.store import Store  # type: ignore
     from douyin.understanding import Understander  # type: ignore
+    from douyin.voice import Voice  # type: ignore
 
 PLUGIN_NAME = "astrbot_plugin_douyin_learning_bot"
 
@@ -172,6 +174,7 @@ class DouyinLearningBot(Star):
         )
         dump_dir = (self.data_dir / "social_dumps") if self.settings.action_dump else None
         self.social = Social(self.browser, self.settings, dump_dir)
+        self.voice = Voice(self.context, self.settings)
         self._pending: list[tuple] = []
 
         self._ready = False
@@ -227,6 +230,7 @@ class DouyinLearningBot(Star):
         )
         dump_dir = (self.data_dir / "social_dumps") if self.settings.action_dump else None
         self.social = Social(self.browser, self.settings, dump_dir)
+        self.voice = Voice(self.context, self.settings)
         self._login_notice_at = 0.0
 
     async def _prompt_login_window(self, umo: str, name: str, seconds: int = 90) -> bool:
@@ -813,20 +817,49 @@ class DouyinLearningBot(Star):
             "分享/评论都要求抖音已登录（/dy login 扫码），没登录会直接告诉你"
         )
 
-    def _comment_text(self, item, analysis) -> str:
+    def _template_comment(self, item, summary: str = "") -> str:
+        """模板兜底：模型写不出来 / voice_enabled=false 时才用。"""
         tpl = self.settings.comment_template or "看完记一笔：{summary}"
         values = {
             "title": item.title or "",
-            "summary": (analysis.summary or "")[:60],
-            "keywords": "、".join(analysis.keywords[:4]),
+            "summary": (summary or "")[:60],
+            "keywords": "",
             "author": item.author or "",
             "url": item.share_url,
         }
         try:
             text = tpl.format(**values)
         except Exception:
-            text = "看完记一笔：" + values["summary"]
+            text = "看完记一笔：" + (values["summary"] or "这条信息量挺大")
         return text.strip()[:120]
+
+    async def _comment_text(self, item, analysis, umo: str = "") -> str:
+        """评论文案：优先让对话模型按当前人格写，写不出来才退回模板。
+
+        模型看到的是「标题 + 作者 + 摘要 + 关键词 + 蒙太奇拼图」，所以它说的是这条视频，
+        而不是把摘要截断套进固定句式。禁词自检不过会重写一次，仍不过就退模板。
+        """
+        if getattr(self.settings, "voice_enabled", True):
+            frames: list[str] = []
+            montage = getattr(analysis, "montage", None)
+            if montage:
+                frames.append(str(montage))
+            try:
+                text = await self.voice.comment(
+                    title=item.title or "",
+                    author=item.author or "",
+                    summary=getattr(analysis, "summary", "") or "",
+                    keywords=list(getattr(analysis, "keywords", []) or []),
+                    transcript=getattr(analysis, "transcript", "") or "",
+                    frames=frames,
+                    umo=umo,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("模型写评论文案失败，退回模板：%s", exc)
+                text = ""
+            if text:
+                return text
+        return self._template_comment(item, getattr(analysis, "summary", "") or "")
 
     def _share_text(self, item) -> str:
         """分享时一起发出去的文字（默认只发链接）。可用 {title} {author} {url}。"""
@@ -864,7 +897,7 @@ class DouyinLearningBot(Star):
                     lines.append(f"　{res}")
                 await asyncio.sleep(self.settings.action_delay_s)
             # 评论
-            text = self._comment_text(item, analysis)
+            text = await self._comment_text(item, analysis)
             mentions, _blocked = self.settings.check_targets(
                 list(self.settings.mention_allowlist), kind="mention"
             )
@@ -1362,7 +1395,14 @@ class DouyinLearningBot(Star):
                 f"  分享通道：{st.share_mode}（panel = 点视频右侧分享面板；im = 私信抽屉）",
                 f"  分享白名单：{'、'.join(st.share_allowlist) or '（空 = 谁都不发）'}",
                 f"  评论 @ 白名单：{'、'.join(st.mention_allowlist) or '（空 = 不 @ 人）'}",
-                f"  评论模板：{st.comment_template or '（默认：看完记一笔：{summary}）'}",
+                (
+                    f"  评论文案：模型按人格写（{st.voice_max_chars} 字内"
+                    f"{'，带一张拼图' if st.voice_frames else '，只看文字'}）"
+                    if st.voice_enabled
+                    else f"  评论文案：模板（{st.comment_template or '看完记一笔：{summary}'}）"
+                ),
+                f"  人格：{st.voice_persona or '（当前会话默认人格）'}"
+                + (f"｜禁词 {st.voice_banned}" if st.voice_banned else ""),
                 f"  分享文案：{st.share_text or '（默认：只发链接）'}",
                 f"  每轮上限：{st.max_actions_per_round} 条｜动作间隔：{st.action_delay_s}s",
                 f"  选片：时长 {st.min_duration_s}-{st.max_duration_s}s｜最低点赞 {st.min_like}"
@@ -1475,10 +1515,26 @@ class DouyinLearningBot(Star):
             text = " ".join(words).strip()
             if not text:
                 rows = await self.store.recent(1)
-                summary = (rows[0].get("summary") if rows else "") or ""
-                text = (self.settings.comment_template or "看完记一笔：{summary}").replace(
-                    "{summary}", summary[:60] or "这条信息量挺大"
-                )
+                row = rows[0] if rows else {}
+                summary = (row.get("summary") or "") or ""
+                keywords = [k for k in str(row.get("keywords") or "").replace("，", ",").split(",") if k.strip()]
+                if getattr(self.settings, "voice_enabled", True):
+                    yield event.plain_result("正在按人格写一句评论…")
+                    try:
+                        text = await self.voice.comment(
+                            title=row.get("desc") or item.title or "",
+                            author=row.get("author") or item.author or "",
+                            summary=summary,
+                            keywords=keywords,
+                            transcript=(row.get("transcript") or "")[:300],
+                            frames=[],
+                            umo=getattr(event, "unified_msg_origin", "") or "",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("模型写评论失败：%s", exc)
+                        text = ""
+                if not text:
+                    text = self._template_comment(item, summary)
             yield event.plain_result(
                 f"正在评论「{item.title[:24] or item.aweme_id}」：{text[:40]}"
                 f"{'　@' + ' @'.join(mentions) if mentions else ''}…"
