@@ -28,3 +28,6 @@ _live/
 .idea/
 .DS_Store
 Thumbs.db
+# 真机抓包 fixture（含本人 uid，只在本地）
+tests/_real_frames.txt
+ws_dumps/
