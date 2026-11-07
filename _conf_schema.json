@@ -209,10 +209,11 @@
           "auto",
           "astrbot",
           "openai",
+          "chat",
           "local",
           "off"
         ],
-        "hint": "auto=AstrBot 的 STT→自填接口→本地 faster-whisper；off=不转写只靠画面"
+        "hint": "auto=AstrBot STT→自填接口→chat 音频→本地；chat=把音频 base64 塞进 chat/completions（qwen3-asr-flash 这类，实测可用）；openai=打 /audio/transcriptions（中转站多为 404）；off=不转写只靠画面"
       },
       "asr_api_base": {
         "type": "string",
@@ -648,6 +649,24 @@
         "type": "int",
         "default": 4,
         "hint": "QQ 侧带上几条最近看过的视频摘要（0 = 不带）"
+      },
+      "knowledge_enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "知识点卡片：把每轮视频摘要压成「主题 + 我的看法」存起来",
+        "hint": "开了以后她聊天时能真的拿出「我学到的东西」，而不是只报流水。关掉就退回只存摘要。"
+      },
+      "knowledge_cards_in_prompt": {
+        "type": "int",
+        "default": 3,
+        "description": "每次跟主人聊天时注入几张卡片（按这句话相关度挑）",
+        "hint": "0 = 不注入卡片；3 是合适的量，太多会挤占上下文。"
+      },
+      "knowledge_review_daily": {
+        "type": "bool",
+        "default": true,
+        "description": "每天写一段「这几天我想明白了什么」，存进 persona_notes.md",
+        "hint": "这段会常驻注入，属于她自己的人格里的一部分。"
       }
     }
   },
