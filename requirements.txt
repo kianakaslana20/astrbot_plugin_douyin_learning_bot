@@ -1,9 +1,11 @@
 # 依赖说明
 # AstrBot 官方镜像 / 本机 venv 已自带下列包，通常无需 pip 安装：
-#   httpx, playwright, Pillow
+#   httpx, playwright, Pillow, curl_cffi
 # 若缺 Playwright 浏览器内核，执行：
 #   python -m playwright install chromium
 # ffmpeg 优先复用 Playwright 自带的那份（ms-playwright/ffmpeg-*/ffmpeg-win64.exe）
 httpx>=0.24
 playwright>=1.40
 Pillow>=9.0
+# 私信 / 通知的只读 HTTP 通道要用它做 TLS 指纹对齐（没有它自动退回 DOM 路径）
+curl_cffi>=0.7
