@@ -6,14 +6,14 @@
 <title>抖音学习助手 · 控制台</title>
 <style>
   :root{
-    --bg:#eef3fa;--panel:#fff;--fg:#16202e;--muted:#6b7c93;--line:#dbe4f0;--field:#f6f9fe;
-    --accent:#2f6feb;--soft:#e8f0ff;--ok:#1f9d6b;--warn:#c2410c;--err:#dc2626;
-    --sh:0 1px 2px rgba(22,45,90,.06),0 12px 28px -16px rgba(22,45,90,.22);
-  }
-  [data-theme="dark"]{
     --bg:#0b1119;--panel:#111a26;--fg:#e6eefb;--muted:#8ea2bd;--line:#1e2b3d;--field:#0f1722;
     --accent:#64a0ff;--soft:#14233a;--ok:#4ade80;--warn:#fb923c;--err:#f87171;
     --sh:0 1px 2px rgba(0,0,0,.5),0 16px 36px -22px rgba(0,0,0,.9);
+  }
+  [data-dy-theme="light"]{
+    --bg:#eef3fa;--panel:#fff;--fg:#16202e;--muted:#6b7c93;--line:#dbe4f0;--field:#f6f9fe;
+    --accent:#2f6feb;--soft:#e8f0ff;--ok:#1f9d6b;--warn:#c2410c;--err:#dc2626;
+    --sh:0 1px 2px rgba(22,45,90,.06),0 12px 28px -16px rgba(22,45,90,.22);
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
@@ -48,6 +48,8 @@
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   label.f{display:flex;align-items:center;justify-content:space-between;gap:10px;
     padding:6px 0;border-bottom:1px dashed var(--line);font-size:13px}
+  label.f>div{min-width:0;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis}
+  label.f input,label.f select{max-width:52%;min-width:64px;flex:0 1 auto}
   label.f:last-child{border-bottom:0}
   label.f span{color:var(--fg)}
   label.f small{display:block;color:var(--muted);font-size:11px}
@@ -168,6 +170,9 @@
 <div id="toast"></div>
 
 <script>
+// 主题要在第一帧之前定下来，否则会先白一下
+document.documentElement.setAttribute("data-dy-theme",
+  localStorage.getItem("dy-theme") || "dark");
 const PLUGIN = "astrbot_plugin_douyin_learning_bot";
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
 const BASE = "/api/plug/" + PLUGIN;
@@ -316,10 +321,14 @@ function renderOverview(s) {
 
   const b = s.browser || {};
   const win = b.window;
+  const winText = (win && win[0] !== null && win[2] !== null)
+    ? `${win[0]},${win[1]} · ${win[2]}×${win[3]}`
+    : "屏外或最小化";
+  const prof = (b.profile || "").replace(/[\\/]+$/, "").split(/[\\/]/).slice(-2).join("/");
   document.getElementById("browser").innerHTML = `
     <div class="kv"><span>登录</span><b>${b.logged_in === true ? "是" : b.logged_in === false ? "否" : "未知"}</b></div>
-    <div class="kv"><span>窗口</span><b>${win ? `${win[0]},${win[1]} · ${win[2]}×${win[3]}` : "没起来"}</b></div>
-    <div class="kv"><span>profile</span><b class="mono" style="font-size:11px">${(b.profile || "").split("\\\\").slice(-1)[0]}</b></div>`;
+    <div class="kv"><span>窗口</span><b>${winText}</b></div>
+    <div class="kv"><span>profile</span><b class="mono" style="font-size:11px" title="${b.profile || ""}">${prof || "—"}</b></div>`;
 
   const ul = document.getElementById("actions");
   ul.innerHTML = "";
@@ -365,8 +374,11 @@ function renderQueue(s) {
   const qc = document.getElementById("qc");
   qc.innerHTML = "";
   for (const it of (q.comment_pending || [])) {
+    const meta = [it.uid ? `uid ${it.uid}` : "", it.cid ? `cid ${it.cid}` : "",
+                  it.aweme_id ? `视频 ${it.aweme_id}` : ""].filter(Boolean).join(" · ");
     const li = document.createElement("li");
-    li.innerHTML = `<b>${it.src || "?"}</b><div class="t mono">${it.payload || ""}</div>`;
+    li.innerHTML = `<b>${it.src || it.who || "?"}</b><div>${it.text || ""}</div>
+      <div class="t mono">${meta}</div>`;
     qc.appendChild(li);
   }
   if (!(q.comment_pending || []).length) qc.innerHTML = '<li class="muted">没有待回的</li>';
@@ -382,8 +394,11 @@ function renderQueue(s) {
 
   const inbox = q.inbox || {};
   document.getElementById("inbox").innerHTML =
-    Object.entries(inbox).map(([k, v]) => `<div class="kv"><span>${k}</span><b>${v}</b></div>`).join("")
-    || '<div class="muted">空</div>';
+    Object.entries(inbox).map(([k, v]) => {
+      const total = (v && typeof v === "object") ? (v.total ?? 0) : v;
+      const pending = (v && typeof v === "object") ? (v.pending ?? 0) : 0;
+      return `<div class="kv"><span>${k}</span><b>${total}${pending ? `（待 ${pending}）` : ""}</b></div>`;
+    }).join("") || '<div class="muted">空</div>';
 }
 
 async function refresh() {
@@ -413,8 +428,9 @@ document.querySelectorAll("nav a").forEach(a => {
 document.getElementById("btn-refresh").addEventListener("click", refresh);
 
 document.getElementById("btn-theme").addEventListener("click", () => {
-  const cur = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  document.documentElement.dataset.theme = cur;
+  const cur = document.documentElement.getAttribute("data-dy-theme") === "light"
+    ? "dark" : "light";
+  document.documentElement.setAttribute("data-dy-theme", cur);
   localStorage.setItem("dy-theme", cur);
 });
 
