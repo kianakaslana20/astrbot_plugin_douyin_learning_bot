@@ -822,3 +822,18 @@ MIT，见 [LICENSE](LICENSE)。
 - `dm_identity`：一行一条 `抖音昵称=QQ号`；两个号是同一个人就写两行。
 
 日志里能看见 `记忆互通：给 QQ 会话带了 N 字抖音记忆`。
+
+
+## 四点一一、自主刷的频率与简报（v0.16.0）
+
+| 配置 | 默认 | 意思 |
+|---|---|---|
+| `brief_mode` | `actions` | `off` 不推 / `actions` 只有真发出去评论或分享才推一句 / `all` 每轮推完整简报 |
+| `notify_done` | 开 | 总开关，关掉就一条简报都不发（失败仍会说你） |
+| `auto_share` | 关 | ask 模式下分享也自动发；评论、点赞不受它影响 |
+| `auto_rounds_per_day` / `auto_items_per_day` | 4 / 8 | 自主刷的日预算，现在会落盘，重载不清零 |
+| `rate_comment_per_day` | 20 | 评论日额度（跑满就不再评论，日志会写「跳过评论：…」） |
+
+自检：`plugin_data/astrbot_plugin_douyin_learning_bot/auto_state.json` 里能看到
+`{"day": "...", "rounds": N, "items": M, "last_round_at": ...}`。要是 `rounds` 一直不涨，
+说明自主刷根本没跑（看日志有没有「自主刷：已启动」）。
