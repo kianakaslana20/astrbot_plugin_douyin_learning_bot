@@ -440,6 +440,23 @@
         "default": "",
         "description": "额外禁词（逗号分隔）",
         "hint": "内置一份 AI 腔黑名单（首先/其次/综上/这个视频/干货满满…），命中会重写一次。这里补你自己的：比如某个口头禅、某个不能提的词。"
+      },
+      "comment_reply_mode": {
+        "type": "string",
+        "description": "评论/私信回复怎么发",
+        "hint": "auto = 模型决定要回就直接发（默认）；ask = 进待确认队列，等你 /dy confirm；off = 只记模型判断不发送",
+        "options": [
+          "auto",
+          "ask",
+          "off"
+        ],
+        "default": "auto"
+      },
+      "comment_reply_once_others": {
+        "type": "bool",
+        "description": "非自己人只回一次",
+        "hint": "开（默认）：不在私信/分享白名单里的人，同一个人最多回一次评论；白名单里的自己人不限次数。关：所有人都不限次数（会像刷屏）",
+        "default": true
       }
     }
   },
