@@ -2386,3 +2386,22 @@ browser / understander / pipeline / social / voice / inbox / agent —— 所以
 
 - 没有分页/搜索，卡片和动作各取最近 40 / 25 条。
 - 不能让页面触发「登录二维码」——那一步仍然只在掉登录时自动叫。
+
+
+## 42. 面板页跑在沙箱 iframe 里（v0.18.2）
+
+`PluginViewPage.vue` 的加载方式：`<iframe :src="contentPath" sandbox="allow-scripts allow-forms allow-downloads">`，
+父页通过 `postMessage` 跟页面里的 `plugin_page_bridge.js` 通信。由此三条硬约束：
+
+1. **不能碰 `localStorage`**：没有 `allow-same-origin` 就是 opaque origin，读一下直接抛
+   `SecurityError`，而且是在脚本顶部抛，整页脚本都不执行 —— 表现就是「点进去没反应」。
+   现在全部包在 `store.get/set` 里。
+2. **不能自己 fetch 后端**：opaque origin 发的请求没有 cookie、跨源直接被拦。
+   必须 `bridge.apiGet("state")`，endpoint 只能是**相对路径**，父页会拼成
+   `/api/v1/plugins/extensions/<插件>/<endpoint>`。
+3. **bridge 的注入顺序不保证**：`<script src="/api/plugin/page/bridge-sdk.js?asset_token=…">`
+   由服务端插在页面里，位置可能在我们自己的脚本之后。所以 `getBridge()` 每次现取，
+   并给 4 秒轮询窗口。
+
+调试用 harness：`E:\工作区\_ui_harness_proxy.py`（静态 + 反代 extensions 接口）配
+`E:\工作区\_ui_harness\index.html`（复刻父页协议），`_shot_iframe.py` / `_click_iframe.py` 出图核对。
