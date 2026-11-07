@@ -87,6 +87,19 @@ CREATE TABLE IF NOT EXISTS comment_reply_log (
 CREATE INDEX IF NOT EXISTS idx_crlog_uid ON comment_reply_log(uid);
 CREATE INDEX IF NOT EXISTS idx_crlog_at ON comment_reply_log(at DESC);
 
+-- 知识点卡片：从「看过」变成「记住」。summary 是流水，卡片才是能拿去说话的实体。
+CREATE TABLE IF NOT EXISTS knowledge_card (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    aweme_id TEXT DEFAULT '',
+    topic TEXT DEFAULT '',
+    gist TEXT DEFAULT '',
+    take TEXT DEFAULT '',
+    keywords TEXT DEFAULT '',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_card_time ON knowledge_card(created_at);
+
 CREATE TABLE IF NOT EXISTS dm_judge (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL,
@@ -359,6 +372,59 @@ class Store:
                 "SELECT status, COUNT(*) c FROM dm_outbox GROUP BY status"
             ).fetchall()
         return {r["status"]: int(r["c"]) for r in rows}
+
+    # ---------- 知识点卡片 ----------
+
+    def _card_add_sync(self, aweme_id: str, topic: str, gist: str, take: str, keywords: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO knowledge_card(aweme_id, topic, gist, take, keywords, created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (aweme_id, topic, gist, take, keywords, time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    async def card_add(self, aweme_id: str, topic: str, gist: str, take: str,
+                       keywords: str = "") -> int:
+        return await asyncio.to_thread(
+            self._card_add_sync, aweme_id, topic, gist, take, keywords
+        )
+
+    def _card_search_sync(self, words: list[str], limit: int) -> list[dict]:
+        words = [w.strip() for w in words if w and w.strip()][:6]
+        if not words:
+            return []
+        where = " OR ".join(["(keywords LIKE ? OR gist LIKE ? OR topic LIKE ?)"] * len(words))
+        args: list = []
+        for w in words:
+            like = f"%{w}%"
+            args.extend([like, like, like])
+        sql = (
+            "SELECT aweme_id, topic, gist, take, keywords FROM knowledge_card "
+            f"WHERE {where} ORDER BY created_at DESC LIMIT ?"
+        )
+        args.append(max(1, int(limit)))
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+    async def card_search(self, words: list[str], limit: int = 3) -> list[dict]:
+        return await asyncio.to_thread(self._card_search_sync, words, limit)
+
+    def _card_recent_sync(self, limit: int, since: float = 0.0) -> list[dict]:
+        sql = ("SELECT aweme_id, topic, gist, take, keywords, created_at "
+               "FROM knowledge_card WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?")
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(sql, (since, max(1, int(limit)))).fetchall()]
+
+    async def card_recent(self, limit: int = 10, since: float = 0.0) -> list[dict]:
+        return await asyncio.to_thread(self._card_recent_sync, limit, since)
+
+    def _card_count_sync(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM knowledge_card").fetchone()[0])
+
+    async def card_count(self) -> int:
+        return await asyncio.to_thread(self._card_count_sync)
 
     async def dm_stats(self) -> dict:
         return await asyncio.to_thread(self._dm_stats_sync)
