@@ -75,6 +75,18 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_key ON inbox(kind, key);
 CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(handled_at, seen_at DESC);
 
+-- 回过谁：非自己人只回一次，靠这张表数次数（外人每 uid 一条，自己人也会记但不受限）
+CREATE TABLE IF NOT EXISTS comment_reply_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid       TEXT NOT NULL,
+    who       TEXT DEFAULT '',
+    cid       TEXT DEFAULT '',
+    aweme_id  TEXT DEFAULT '',
+    at        INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_crlog_uid ON comment_reply_log(uid);
+CREATE INDEX IF NOT EXISTS idx_crlog_at ON comment_reply_log(at DESC);
+
 CREATE TABLE IF NOT EXISTS dm_judge (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL,
@@ -165,6 +177,34 @@ class Store:
 
     async def inbox_pending(self, kind: str = "", limit: int = 20) -> list[dict]:
         return await asyncio.to_thread(self._inbox_pending_sync, kind, limit)
+
+    # ---------- 评论回复计数（非自己人只回一次）----------
+
+    def _reply_count_sync(self, uid: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM comment_reply_log WHERE uid=?", (str(uid),)
+            ).fetchone()
+            return int(row[0] if row else 0)
+
+    async def reply_count(self, uid: str) -> int:
+        """这个人我们回过几次了。"""
+        if not uid:
+            return 0
+        return await asyncio.to_thread(self._reply_count_sync, uid)
+
+    def _reply_hit_sync(self, uid: str, who: str, cid: str, aweme_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO comment_reply_log (uid, who, cid, aweme_id, at) VALUES (?,?,?,?,?)",
+                (str(uid), who or "", cid or "", aweme_id or "", int(time.time())),
+            )
+
+    async def reply_hit(self, uid: str, who: str = "", cid: str = "", aweme_id: str = "") -> None:
+        """记下「回过这个人一次」，用于非自己人的一次上限。"""
+        if not uid:
+            return
+        await asyncio.to_thread(self._reply_hit_sync, uid, who, cid, aweme_id)
 
     def _inbox_done_sync(self, kind: str, key: str, result: str) -> None:
         with self._connect() as conn:
