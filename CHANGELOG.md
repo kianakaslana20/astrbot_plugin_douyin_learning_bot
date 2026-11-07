@@ -1,3 +1,38 @@
+## 0.17.0 —— 听得见、记得住、用得上
+
+这一版回答一个问题：「刷了这么多，她到底学到什么了」。之前三条都不成立：
+语音没转写（`transcript` 全空）、摘要只是流水（没有能被拿来聊的结论）、
+注入给 QQ 会话的只有「最近 4 条摘要」。现在三块都补上了：
+
+### 听得见（ASR 第四条通道）
+- `asr_backend` 新增 `chat`：把音频 base64 塞进 `compatible-mode/v1/chat/completions`
+  （`qwen3-asr-flash` 实测可用）。中转站的 `/audio/transcriptions` 全是 404，
+  `qwen-audio-*` 只吃公网 URL，`realtime` 走 chat 回空 —— 这条路才通。
+- `auto` 顺序变成 `astrbot → openai → chat → local`。
+- 真机：`ASR 使用后端 chat，转写 1239 字`。
+
+### 记得住（知识点卡片）
+- 新表 `knowledge_card(aweme_id, topic, gist, take, keywords, created_at)`。
+- 每轮结束用**一次**模型调用把 8 条摘要压成卡片：`topic` 6~14 字，
+  `take` 第一人称 20~40 字（「我以前以为…现在觉得…」），只要真有信息量的。
+- 真机样例：`欧美脸未必更高级` / `我以前也以为欧美脸天生高级，现在才明白是屏幕上全是挑出来的人，幸存者偏差罢了…`
+
+### 用得上（按需注入 + 每日复盘）
+- `_bridge_prompt_text(query)` 改动：不再只塞「最近 4 条」，先按你这句话
+  切词去 `knowledge_card` 里检索（2/3/4 字片段 LIKE），命中不到才退回最近 2 张。
+- 每天一次复盘：把 24 小时内的卡片 + 最近聊天揉成一段第一人称想法，
+  写进 `persona_notes.md`（最多留 30 段），并随 system prompt 注入。
+
+### 顺手修
+- `agent.digest_cards` / `review_day` 用了 `asyncio.wait_for` 但模块没 `import asyncio`
+  （一直 `NameError` 被吞）。
+- `_digest_knowledge` 把 `RoundResult.analyzed` 当成对象读属性，实际是
+  `list[tuple[AwemeItem, Analysis]]` → 一条都提不出来。
+- AstrBot 的 logger 对 %-style 参数会抛 `Formatting field not found in record`，
+  新加的日志全改 f-string。
+
+测试：`tests/` 116 项 + `_test_knowledge.py`（卡片检索）全过。
+
 ## 0.16.0 —— 自主刷别再每五分钟一次，简报也别每轮都吵
 
 三件事，都是「你以为在跑、其实没跑」或「你以为没跑、其实在乱跑」：
