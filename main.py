@@ -1102,6 +1102,75 @@ class DouyinLearningBot(Star):
                 return v
         return ""
 
+    def _bridge_people(self) -> list[str]:
+        """哪几个抖音昵称的记忆要带到 QQ 那边去。"""
+        names: list[str] = []
+        for attr in ("dm_chat_allow", "dm_targets", "dm_self_names"):
+            raw = (getattr(self.settings, attr, "") or "").replace("，", ",").replace("、", ",")
+            for item in raw.split(","):
+                item = item.strip()
+                if item and item not in names:
+                    names.append(item)
+        return names
+
+    async def _bridge_prompt_text(self) -> str:
+        """QQ 会话要多带的那段：抖音私聊最近几句 + 最近看过的视频。"""
+        lines = int(getattr(self.settings, "memory_bridge_lines", 6) or 0)
+        items = int(getattr(self.settings, "memory_bridge_items", 4) or 0)
+        blocks: list[str] = []
+        if lines:
+            for who in self._bridge_people():
+                try:
+                    rows = self.memory.recent(who, limit=lines)
+                except Exception:  # noqa: BLE001
+                    rows = []
+                if rows:
+                    blocks.append(
+                        f"你在抖音私信里和「{who}」最近聊过（同一个人，别装作不认识）：\n"
+                        + "\n".join(rows)
+                    )
+        if items:
+            try:
+                rows = await self.store.recent(limit=items)
+            except Exception:  # noqa: BLE001
+                rows = []
+            seen: list[str] = []
+            for row in rows or []:
+                summary = str(row.get("summary") or "").strip()
+                if not summary:
+                    continue
+                title = str(row.get("title") or "").strip()[:40]
+                seen.append(f"- {title or '（无标题）'}：{summary[:120]}")
+            if seen:
+                blocks.append(
+                    "你最近刷抖音看过的（你自己看的，可以主动提）：\n" + "\n".join(seen)
+                )
+        return "\n\n".join(blocks)
+
+    @filter.on_llm_request()
+    async def dy_memory_bridge(self, event: AstrMessageEvent, req) -> None:
+        """主人在 QQ 上跟她说话时，把抖音那边的记忆一并带进 system prompt。"""
+        if not getattr(self.settings, "memory_bridge", True):
+            return
+        ids = {v for v in self._identity_map().values() if v}
+        if not ids:
+            return
+        try:
+            sender = str(event.get_sender_id() or "")
+        except Exception:  # noqa: BLE001
+            sender = ""
+        if sender not in ids:
+            return                      # 只对主人自己的号生效，别人的会话不塞这些
+        try:
+            extra = await self._bridge_prompt_text()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("记忆互通：拼背景失败（%s: %s）", type(exc).__name__, exc)
+            return
+        if not extra:
+            return
+        req.system_prompt = ((getattr(req, "system_prompt", "") or "") + "\n\n" + extra).strip()
+        logger.info("记忆互通：给 QQ 会话带了 %s 字抖音记忆", len(extra))
+
     def _window_needs_restore(self) -> bool:
         """窗口跑到屏幕外/被最小化了吗（只在 quiet_window 关掉时有意义）。"""
         if getattr(self.settings, "quiet_window", True):
@@ -1739,6 +1808,8 @@ class DouyinLearningBot(Star):
             if why:
                 return f"先不回：{why}"
         # 0.10.0：先问模型「该不该回、回什么」
+        # 0.15.0：这个人在 QQ 上有号的话，把 QQ 那侧的近况也交给模型
+        qq_id = self._qq_of(who)
         text0 = ""
         if getattr(self.settings, "agent_enabled", True):
             decision = await self.agent.handle_douyin_event(
@@ -1751,6 +1822,7 @@ class DouyinLearningBot(Star):
                     "raw_frame_id": entry.extra.get("raw_frame_id", ""),
                 },
                 umo,
+                extra_history=self.memory.from_host(qq_id, 6) if qq_id else None,
             )
             if decision.get("model") is False:
                 # 判断用的模型没就绪：不退化成哑巴，走下面「日常聊天」那条路照样回
@@ -1770,7 +1842,6 @@ class DouyinLearningBot(Star):
                             await self.limits.hit_async("dm")
                         return f"回了：「{text0}」（模型判断：{decision.get('reason') or '—'}）"
                     return f"回了但没发出去：「{text0[:20]}」（{detail0}）"
-        qq_id = self._qq_of(who)
         memory = self.memory.background(
             person=who,
             qq_id=qq_id,
