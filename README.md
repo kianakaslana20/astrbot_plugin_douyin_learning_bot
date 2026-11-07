@@ -805,3 +805,20 @@ MIT，见 [LICENSE](LICENSE)。
 - 自己人（白名单里的）不限次数；外人回一次就收手，防着跟陌生人吵起来。
 - 计数在 `comment_reply_log` 表，发送成功才记；被风控吞掉的不算，下次还能试。
 - 分享仍然走 `action_mode`，不在这里改。
+
+
+## 四点一零、两边记忆互通（v0.15.0）
+
+| 方向 | 怎么做的 | 生效条件 |
+|---|---|---|
+| QQ ← 抖音 | `on_llm_request` 里把「抖音私聊最近几句 + 最近看过的视频摘要」追加到 system prompt | `memory_bridge` 开着，且发消息的号在 `dm_identity` 里 |
+| 抖音 ← QQ | 判断/聊天时读 AstrBot 的 `platform_message_history` | `dm_identity` 里配了「抖音昵称=QQ号」 |
+
+配置（inbox 组）：
+
+- `memory_bridge`（默认开）：QQ 侧要不要带抖音记忆。
+- `memory_bridge_lines`（默认 6）：带几句抖音私聊，0 = 不带。
+- `memory_bridge_items`（默认 4）：带几条看过的视频摘要，0 = 不带。
+- `dm_identity`：一行一条 `抖音昵称=QQ号`；两个号是同一个人就写两行。
+
+日志里能看见 `记忆互通：给 QQ 会话带了 N 字抖音记忆`。
