@@ -9,6 +9,8 @@ xinference_stt / mimo_stt）都需要用户自己再加一个。插件不能因�
 - ``astrbot``：用 context.get_using_stt_provider()，零配置，前提是用户配过；
 - ``openai``：直接打 ``{base}/audio/transcriptions``，硅基流动 SenseVoice、OpenAI Whisper、
   各类 one-api 中转都通；
+- ``chat``：把音频 base64 塞进 chat/completions 的 input_audio，千问系
+  ``qwen3-asr-flash`` 这类模型直接回文字（实测 2026-11-08 在 maas 中转上可用）；
 - ``local``：装了 faster-whisper 就在本地转，不花 API 额度；
 - 都没有：不转写，只靠 9 帧画面理解，并在简报里注明「未获得语音转写」。
 """
@@ -61,6 +63,62 @@ async def _openai_transcribe(wav: Path, settings: Settings) -> str:
     return ""
 
 
+async def _chat_audio_transcribe(wav: Path, settings: Settings) -> str:
+    """POST {base}/chat/completions，把整段音频当 input_audio 传进去。
+
+    为什么需要这条：中转站（maas / DashScope 兼容模式）不暴露
+    ``/audio/transcriptions``（一律 404），但 ``qwen3-asr-flash`` 走 chat 接口就能转写，
+    返回的是 ``choices[0].message.content``。文件大小受 base64 膨胀 4/3 影响，
+    所以调用方要先按 ``asr_max_seconds`` 把音频截短。
+    """
+    import base64
+    import json
+
+    base = (settings.asr_api_base or "").rstrip("/")
+    if not base:
+        raise ASRError("未填 asr_api_base")
+    if not base.endswith("/chat/completions"):
+        base = f"{base}/chat/completions"
+    raw = wav.read_bytes()
+    if len(raw) > 24 * 1024 * 1024:
+        raise ASRError(f"音频太大（{len(raw) // 1024} KB），先截短")
+    payload = {
+        "model": settings.asr_model or "qwen3-asr-flash",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "data:audio/wav;base64,"
+                            + base64.b64encode(raw).decode(),
+                            "format": "wav",
+                        },
+                    }
+                ],
+            }
+        ],
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if settings.asr_api_key:
+        headers["Authorization"] = f"Bearer {settings.asr_api_key}"
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.post(base, headers=headers, content=json.dumps(payload))
+    if resp.status_code != 200:
+        raise ASRError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    body = resp.json()
+    try:
+        msg = (body.get("choices") or [{}])[0].get("message") or {}
+    except Exception:  # noqa: BLE001
+        msg = {}
+    text = msg.get("content")
+    if isinstance(text, list):
+        text = "".join(str(part.get("text") or "") for part in text if isinstance(part, dict))
+    return str(text or "").strip()
+
+
 async def _astrbot_transcribe(wav: Path, settings: Settings, context, umo: str) -> str:
     provider = None
     try:
@@ -104,12 +162,14 @@ async def transcribe(wav: Path, settings: Settings, context, umo: str) -> tuple[
         order = ["astrbot"]
     elif backend == "openai":
         order = ["openai"]
+    elif backend == "chat":
+        order = ["chat"]
     elif backend == "local":
         order = ["local"]
     elif backend == "off":
         order = []
     else:  # auto
-        order = ["astrbot", "openai", "local"]
+        order = ["astrbot", "openai", "chat", "local"]
 
     for name in order:
         try:
@@ -119,6 +179,10 @@ async def transcribe(wav: Path, settings: Settings, context, umo: str) -> tuple[
                 if not (settings.asr_api_base and settings.asr_api_key):
                     continue
                 text = await _openai_transcribe(wav, settings)
+            elif name == "chat":
+                if not (settings.asr_api_base and settings.asr_api_key):
+                    continue
+                text = await _chat_audio_transcribe(wav, settings)
             else:
                 text = await _local_transcribe(wav, settings)
         except ASRError as exc:
