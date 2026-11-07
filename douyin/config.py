@@ -261,7 +261,10 @@ class Settings:
     dm_send_enabled: bool = True
     dm_targets: str = ""            # 只允许发给名单里这些人（空 = 谁都不发）
     dm_quota_separate: bool = True  # True：主动私信单独配额；False：和「回私信」共用一个池
-    dm_readback: bool = True        # 发完回读校验，false 只是不校验
+    dm_readback: bool = True
+    dm_http: bool = True
+    dm_http_limit: int = 20
+    notice_http: bool = True        # 发完回读校验，false 只是不校验
     dm_identity: str = ""
     dm_self_names: str = ""    # 自聊会话（自己跟自己）：这些会话里靠"我说过什么"来分辨谁在说,     # 抖音昵称=QQ号，一行一条
     voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
