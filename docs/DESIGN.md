@@ -2259,3 +2259,49 @@ WS 帧解出来了，但只解到「谁、说了什么、什么时候」。要�
 - 只读：两个方向都不写对方的表。
 - 长度可控：句数/条数都从配置来，`0` 就是关掉那一段。
 - 隐私：`dm_identity` 没配的号，两边的记忆都互不可见。
+
+
+## 39. 自主刷的频率、简报与额度（v0.16.0）
+
+### 39.1 为什么它每五分钟刷一次
+
+`_auto_budget_ok()` 里的 `_auto_day / _auto_rounds_today / _auto_items_today / _last_round_at`
+全是内存属性。`/dy reload` 或宿主重启之后：
+
+- `_last_round_at = 0` → `since = 9999 分钟` → `due_by_time` 恒真；
+- `_auto_rounds_today = 0` → 日预算恒有余量。
+
+于是每 5 分钟的 `_auto_think_loop` 都会去问模型「要不要刷」，模型看到「好久没刷了」就同意。
+今天 22:24 / 22:33 / 22:38 / 22:43 / 22:48 连续五轮就是这么来的。
+
+修法：`_auto_state_load()` / `_auto_state_save()` 落 `auto_state.json`，
+进程内只读一次（`_auto_state_loaded` 守卫），日期变了就清零并落盘。
+
+### 39.2 简报为什么发不出去
+
+`_maybe_autonomous_round` 里 `jobs.submit("round", self._last_umo or "", take)` ——
+`_last_umo` 是「最近一次收到人消息的会话」，重启后是空串，
+`context.send_message("")` 直接抛 `不合法的 session 字符串: not enough values to unpack`。
+改成 `self._push_target or self._last_umo`，都没有就只刷不推（日志写明）。
+
+### 39.3 brief_mode
+
+| 值 | 行为 |
+|---|---|
+| `off` | 一条都不推 |
+| `actions`（默认） | `_auto_actions` 把真发出去的那几行记到 `self._last_action_lines`，非空才推 |
+| `all` | 每轮推完整简报（老行为） |
+
+「只在真动手时说话」是这台机器的正确默认 —— 一轮什么都没做的话，
+用户收到的应该是一个赞或一条评论的通知，而不是一段"我今天看了什么"。
+
+### 39.4 额度
+
+评论日额度 8 条在今天上午 10 点前就打满，之后每轮都只点赞不评论 ——
+日志里是「跳过评论：今天的评论额度用完了」，但那段话进了简报，而简报推送正坏着，
+所以表现成"完全不评论"。线上调到 20，点赞 30 → 60。
+
+### 39.5 仍缺
+
+- 额度是按天清零的粗粒度控制，没有「按小时平滑」。
+- `auto_state.json` 只是单机状态，多实例部署会各算各的。
