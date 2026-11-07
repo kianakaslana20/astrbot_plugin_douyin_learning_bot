@@ -293,6 +293,18 @@ class DouyinLearningBot(Star):
             out["im"] = await self.imapi.probe()
         if "notice" in targets:
             out["notice"] = await self.noticeapi.probe()
+        if "open" in targets:
+            aweme = str(raw.get("aweme_id") or "") if isinstance(raw, dict) else ""
+            try:
+                p2 = await self.browser.page()
+                out["open"] = await self.social._open_video(p2, aweme)
+                out["open_url"] = p2.url
+            except Exception as exc:  # noqa: BLE001
+                out["open"] = f"{type(exc).__name__}: {exc}"
+        if "video" in targets:
+            out["video"] = await self._probe_video(
+                str(raw.get("aweme_id") or "") if isinstance(raw, dict) else ""
+            )
         out["ms"] = int((time.time() - started) * 1000)
         try:
             (self.data_dir / "probe_result.json").write_text(
@@ -319,6 +331,167 @@ class DouyinLearningBot(Star):
             logger.info("探针：浏览器还没起来，下一轮再试（第 %s 次）", attempt + 1)
         except OSError:
             pass
+
+    async def _probe_video(self, aweme_id: str) -> dict:
+        """详情页到底给不给 <video>：分享靠它，评论走接口不需要。
+
+        分享一路挂在「打开详情页 → 点分享 → 选会话 → 发送」上，最近每次都在第一步
+        「没有播放器」失败，所以要能看见页面到底长什么样。
+        """
+        info: dict = {"aweme_id": aweme_id, "tries": []}
+        try:
+            page = await self.browser.page()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        urls = []
+        if aweme_id:
+            urls.append(f"https://www.douyin.com/video/{aweme_id}")
+            urls.append(f"https://www.douyin.com/discover?modal_id={aweme_id}")
+        js = """() => ({
+          href: location.href,
+          video: !!document.querySelector('video'),
+          vw: (document.querySelector('video') || {}).videoWidth || 0,
+          error_page: !!document.querySelector('[data-e2e="error-page"]'),
+          login: !!document.querySelector('[data-e2e="login-button"]'),
+          e2e: Array.from(document.querySelectorAll('[data-e2e]'))
+                   .slice(0, 12).map((n) => n.getAttribute('data-e2e')),
+          text: (document.body ? document.body.innerText : '').slice(0, 200),
+        })"""
+        for url in urls:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(3000)
+                got = await page.evaluate(js) or {}
+                got["url"] = url
+                info["tries"].append(got)
+            except Exception as exc:  # noqa: BLE001
+                info["tries"].append({"url": url, "error": f"{type(exc).__name__}: {exc}"})
+        return info
+
+    # ---------- 学到的知识：卡片化 / 检索 / 复盘 ----------
+
+    def _notes_path(self):
+        return self.data_dir / "persona_notes.md"
+
+    async def _digest_knowledge(self, analyzed: list, umo: str = "") -> int:
+        """一轮看完，把摘要压成知识点卡片存起来。返回新增条数。"""
+        if not getattr(self.settings, "knowledge_enabled", True):
+            return 0
+        items = []
+        # RoundResult.analyzed 是 list[tuple[AwemeItem, Analysis]]，也兼容直接给对象。
+        for raw in analyzed or []:
+            item, an = (raw if isinstance(raw, tuple) and len(raw) == 2
+                        else (raw, getattr(raw, "analysis", None)))
+            aweme = str(getattr(item, "aweme_id", "") or getattr(raw, "aweme_id", "") or "")
+            summary = (str(getattr(an, "summary", "") or "")
+                       or str(getattr(item, "summary", "") or ""))
+            if not aweme or not summary:
+                continue
+            keywords = getattr(an, "keywords", "") or getattr(item, "keywords", "") or ""
+            if isinstance(keywords, (list, tuple)):
+                keywords = " ".join(str(k) for k in keywords)
+            items.append(
+                {
+                    "aweme_id": aweme,
+                    "title": str(getattr(item, "desc", "") or ""),
+                    "summary": summary,
+                    "keywords": str(keywords),
+                }
+            )
+        if not items:
+            logger.info(f"知识点：这一轮没有可提炼的摘要（analyzed={len(analyzed or [])} 条）")
+            return 0
+        try:
+            cards = await self.agent.digest_cards(items, umo)
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"知识点：提炼失败（{type(exc).__name__}: {exc}）")
+            return 0
+        added = 0
+        for card in cards or []:
+            try:
+                await self.store.card_add(
+                    card.get("aweme_id", ""), card.get("topic", ""),
+                    str(card.get("gist", "") or "")[:200],
+                    card.get("take", ""), str(card.get("keywords", "") or ""),
+                )
+                added += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.info("知识点：写库失败（%s）", type(exc).__name__)
+                break
+        if added:
+            logger.info(f"知识点：这一轮记下 {added} 张卡片")
+        return added
+
+    async def _knowledge_lines(self, query: str = "", limit: int = 3) -> list[str]:
+        """按当前这句话里的词去找相关卡片；没词就退回最近两张。"""
+        if not getattr(self.settings, "knowledge_enabled", True):
+            return []
+        words: list[str] = []
+        text = (query or "").strip()
+        for n in (2, 3, 4):
+            for i in range(0, max(0, len(text) - n + 1)):
+                chunk = text[i:i + n]
+                if chunk.strip() and chunk not in words:
+                    words.append(chunk)
+        cap = int(getattr(self.settings, "knowledge_cards_in_prompt", limit) or limit)
+        try:
+            rows = await self.store.card_search(words[:40], limit=cap) if words else []
+            if not rows:
+                rows = await self.store.card_recent(limit=min(2, cap))
+        except Exception:  # noqa: BLE001
+            return []
+        return [f"- {r.get('topic')}：{r.get('take')}" for r in rows or [] if r.get("topic")]
+
+    def _notes_lines(self, limit: int = 2) -> list[str]:
+        """人格档案里最近几段复盘。"""
+        try:
+            raw = self._notes_path().read_text("utf-8")
+        except Exception:  # noqa: BLE001
+            return []
+        chunks = [c.strip() for c in raw.split("\n\n---\n\n") if c.strip()]
+        return chunks[-max(1, limit):]
+
+    async def _daily_review(self, umo: str = "") -> str:
+        """每天一次：把当天的卡片 + 最近对话揉成一段，追加进人格档案。"""
+        if not getattr(self.settings, "knowledge_review_daily", True):
+            return ""
+        today = time.strftime("%Y-%m-%d")
+        if getattr(self, "_review_day", "") == today:
+            return ""
+        try:
+            since = time.time() - 86400
+            cards = await self.store.card_recent(limit=12, since=since)
+        except Exception:  # noqa: BLE001
+            cards = []
+        chats: list[str] = []
+        for who in self._bridge_people()[:2]:
+            try:
+                chats.extend(self.memory.recent(who, limit=5))
+            except Exception:  # noqa: BLE001
+                continue
+        if not cards and not chats:
+            logger.info("复盘：今天既没有卡片也没有对话，跳过")
+            return ""
+        logger.info(f"复盘：{len(cards)} 张卡片 + {len(chats)} 句对话，交给模型")
+        try:
+            text = await self.agent.review_day(cards, chats, umo)
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"复盘：失败（{type(exc).__name__}: {exc}）")
+            return ""
+        if not text:
+            return ""
+        self._review_day = today
+        try:
+            old = ""
+            if self._notes_path().exists():
+                old = self._notes_path().read_text("utf-8")
+            blocks = [b.strip() for b in old.split("\n\n---\n\n") if b.strip()]
+            blocks.append(f"[{today}] {text}")
+            self._notes_path().write_text("\n\n---\n\n".join(blocks[-30:]), "utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"复盘：存档失败（{type(exc).__name__}: {exc}）")
+        logger.info(f"复盘：写进人格档案（{len(text)} 字）")
+        return text
 
     def _detect_platform(self) -> str:
         """猜一个平台 id（就是 umo 的第一段，比如「大肥鱼」）。"""
@@ -900,6 +1073,7 @@ class DouyinLearningBot(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("保留期清理失败（不影响这一轮）：%s", exc)
         self._last_round_at = time.time()
+        self._auto_state_save()
         try:
             await self._migrate_kernel_profile()
             if not await self._ensure_login(job):
@@ -936,6 +1110,10 @@ class DouyinLearningBot(Star):
         if result.error and not result.text:
             job.error = result.error
             return result
+        try:
+            await self._digest_knowledge(getattr(result, "analyzed", []) or [], job.umo)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("知识点：这一轮没记成（%s: %s）", type(exc).__name__, exc)
         try:
             self._last_action_lines = []
             extra = await self._auto_actions(result)
@@ -1140,8 +1318,11 @@ class DouyinLearningBot(Star):
                     names.append(item)
         return names
 
-    async def _bridge_prompt_text(self) -> str:
-        """QQ 会话要多带的那段：抖音私聊最近几句 + 最近看过的视频。"""
+    async def _bridge_prompt_text(self, query: str = "") -> str:
+        """QQ 会话要多带的那段：抖音私聊最近几句 + 看过的视频 + 知识点卡片 + 复盘。
+
+        `query` 是对方这一句原话：有它才能「按相关」捞卡片，而不是永远塞最近的。
+        """
         lines = int(getattr(self.settings, "memory_bridge_lines", 6) or 0)
         items = int(getattr(self.settings, "memory_bridge_items", 4) or 0)
         blocks: list[str] = []
@@ -1172,6 +1353,18 @@ class DouyinLearningBot(Star):
                 blocks.append(
                     "你最近刷抖音看过的（你自己看的，可以主动提）：\n" + "\n".join(seen)
                 )
+        try:
+            cards = await self._knowledge_lines(query)
+        except Exception:  # noqa: BLE001
+            cards = []
+        if cards:
+            blocks.append(
+                "你刷抖音学到的、可以拿来聊的（你自己的看法，别当资料念）：\n"
+                + "\n".join(cards)
+            )
+        notes = self._notes_lines(2)
+        if notes:
+            blocks.append("你最近的想法（写在你自己档案里的）：\n" + "\n\n".join(notes))
         return "\n\n".join(blocks)
 
     @filter.on_llm_request()
@@ -1189,7 +1382,15 @@ class DouyinLearningBot(Star):
         if sender not in ids:
             return                      # 只对主人自己的号生效，别人的会话不塞这些
         try:
-            extra = await self._bridge_prompt_text()
+            said = ""
+            for attr in ("message_str", "message"):
+                try:
+                    said = str(getattr(event, attr) or "")
+                except Exception:  # noqa: BLE001
+                    said = ""
+                if said:
+                    break
+            extra = await self._bridge_prompt_text(said)
         except Exception as exc:  # noqa: BLE001
             logger.info("记忆互通：拼背景失败（%s: %s）", type(exc).__name__, exc)
             return
@@ -1745,12 +1946,16 @@ class DouyinLearningBot(Star):
         while True:
             try:
                 await asyncio.sleep(300)
+                try:
+                    await self._daily_review(self._push_target or "")
+                except Exception as exc:  # noqa: BLE001
+                    logger.info(f"复盘：这一轮没写成（{type(exc).__name__}: {exc}）")
                 await self._maybe_autonomous_round()
             except asyncio.CancelledError:
                 logger.info("自主刷已停止")
                 return
             except Exception as exc:  # noqa: BLE001
-                logger.warning("自主刷异常：%s", exc)
+                logger.warning(f"自主刷异常：{type(exc).__name__}: {exc}")
 
     def _auto_state_path(self):
         return self.data_dir / "auto_state.json"
@@ -1787,6 +1992,10 @@ class DouyinLearningBot(Star):
             self._last_round_at = 0.0
 
     def _auto_state_save(self) -> None:
+        if not getattr(self, "_auto_day", ""):
+            # 进程刚起来、预算还没检查过就先把 last_round_at 落盘时，day 会是空串，
+            # 明天再读回来等于「跨天」，计数会莫名其妙清零。
+            self._auto_day = time.strftime("%Y-%m-%d")
         try:
             self._auto_state_path().write_text(
                 json.dumps(
@@ -1855,6 +2064,7 @@ class DouyinLearningBot(Star):
         self._auto_rounds_today += 1
         self._auto_items_today += take
         self._last_round_at = now
+        self._auto_state_save()
         logger.info("自主刷：模型说值得刷 %s 条（%s）", take, decision.get("reason") or "")
         if getattr(self.settings, "notify_start", False):
             await self._ask_help(f"自主判断触发：我刷一轮（{take} 条）。理由：{decision.get('reason') or '时间到了'}")
