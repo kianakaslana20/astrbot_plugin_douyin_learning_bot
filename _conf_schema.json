@@ -627,6 +627,22 @@
         "type": "bool",
         "default": true,
         "description": "评论/@ 通知改走 HTTP（能拿到真实 comment_id）"
+      },
+      "memory_bridge": {
+        "type": "bool",
+        "default": true,
+        "hint": "把抖音私聊和看过的视频接到 QQ 那边（她在 QQ 里也记得抖音聊过什么）",
+        "description": "开着时，你在 QQ 跟她说话，她会带上「抖音私聊最近几句 + 最近看过的视频摘要」。反方向（抖音侧读 QQ 历史）靠 dm_identity 的映射，不用这个开关。"
+      },
+      "memory_bridge_lines": {
+        "type": "int",
+        "default": 6,
+        "hint": "QQ 侧带上几句抖音私聊（0 = 不带）"
+      },
+      "memory_bridge_items": {
+        "type": "int",
+        "default": 4,
+        "hint": "QQ 侧带上几条最近看过的视频摘要（0 = 不带）"
       }
     }
   },
