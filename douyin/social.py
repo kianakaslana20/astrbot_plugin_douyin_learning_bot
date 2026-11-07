@@ -407,10 +407,13 @@ class Social:
         `data-e2e="error-page"`，播放器控件和分享面板全都没有，后面所有
         DOM 操作都会以「找不到元素」告终。所以这里先验页面，再试备用入口。
         """
+        # 2026-11-08 实测：`/video/<id>` 现在渲染出来只有 player-container、没有 <video>
+        # （`video: false`），而 `/discover?modal_id=` 会跳到 `/jingxuan?modal_id=`
+        # 并且真的带播放器（`videoWidth=1080`）。所以先走 modal 那条，`/video/` 只当备用。
         urls = (
+            f"https://www.douyin.com/discover?modal_id={aweme_id}",
             VIDEO_URL.format(aweme_id=aweme_id),
             f"https://www.douyin.com/discover?modal_id={aweme_id}",
-            VIDEO_URL.format(aweme_id=aweme_id),   # 详情页偶发白屏，同一个 URL 再来一次
         )
         opened_js = """() => {
           const err = document.querySelector('[data-e2e="error-page"]');
@@ -424,8 +427,15 @@ class Social:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_s() * 1000)
                 # 详情页会自动连播下一条（实测从「第2集」跳到「第3集」），
                 # 播放一换 aweme_id 就变了，后面所有接口调用全会打到别的视频上。
-                await page.wait_for_timeout(2400)
-                got = await page.evaluate(opened_js) or {}
+                await page.wait_for_timeout(1200)
+                # modal 那条要 3 秒左右才把播放器挂上来（实测 3.0s 才有 videoWidth），
+                # 固定等 2.4 秒会误判成「没有播放器」——所以这里轮询到 8 秒。
+                got = {}
+                for _ in range(8):
+                    got = await page.evaluate(opened_js) or {}
+                    if got.get("ok"):
+                        break
+                    await page.wait_for_timeout(900)
                 if not got.get("ok"):
                     logger.info(
                         "[social] %s 打不开（%s），换下一个入口", aweme_id, got.get("why") or "?"
