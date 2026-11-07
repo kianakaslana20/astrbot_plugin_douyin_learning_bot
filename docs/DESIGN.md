@@ -2350,3 +2350,39 @@ WS 帧解出来了，但只解到「谁、说了什么、什么时候」。要�
 - 卡片没有向量检索，全靠 LIKE 切片，同义改写命中率一般。
 - ASR 只对**新下载**的视频生效，历史 171 条不会回填。
 - 复盘是「最近 24 小时」，不是「这周学到什么」的长期沉淀。
+
+
+## 41. 插件自带一页控制台（v0.18.0）
+
+### 41.1 为什么是 views/ 而不是另起一个服务
+
+AstrBot 4.29 的插件页机制：插件根目录下 `views/<页面名>/index.html`
+（`PLUGIN_PAGE_ROOT_DIR_NAMES = ("views", "pages")`），由面板把 HTML 取出并注入
+`plugin_page_bridge.js`，页面里就有 `window.AstrBotPluginView`（别名 `AstrBotPluginPage`），
+自带 `apiGet/apiPost/upload/download/subscribeSSE`。所以不用自己开端口、不用自己搞鉴权。
+`dashboard` 这个页面名就是入口，面板插件详情里会列出来。
+
+### 41.2 后端怎么挂
+
+`context.register_web_api(route, handler, methods, desc)` → 实际路由
+`/api/v1/plugins/extensions/<插件>/<route>`，旧别名 `/api/plug/<插件>/<route>`。
+页面里 `BASE = "/api/plug/" + PLUGIN`，优先走 bridge，取不到就退回带
+`credentials: "include"` 的 fetch。
+
+### 41.3 写配置的边界
+
+`douyin/webui.py` 的 `EDITABLE` 是唯一能改的集合（43 项，类型 bool / int / enum / str）。
+`apply_updates()` 只按白名单写，枚举值不在选项里就进 `rejected`，
+`api_save` 写盘后调 `_reload_settings()` 重建 `Settings` 并推给
+browser / understander / pipeline / social / voice / inbox / agent —— 所以改完立即生效。
+
+### 41.4 接口异常不甩 500
+
+`_web_guard(handler)` 把所有异常收成 `{"ok": false, "message": "类型: 原因"}`。
+面板点一下正好撞上页面跳转（`Page.evaluate: Execution context was destroyed`）时，
+人看到的是一句原因，不是 Internal server error。
+
+### 41.5 仍缺
+
+- 没有分页/搜索，卡片和动作各取最近 40 / 25 条。
+- 不能让页面触发「登录二维码」——那一步仍然只在掉登录时自动叫。
