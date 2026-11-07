@@ -34,7 +34,7 @@ help: |-
   /dy calib [n]  抓一批样本，看当前阈值会学哪些、过筛率多少
   /dy kb [n]     看最近 n 条知识库
   /dy update     检查 GitHub 有没有新版本（update apply 直接拉取）
-version: 0.16.0
+version: 0.17.0
 author: YG
 repo: https://github.com/kianakaslana20/astrbot_plugin_douyin_learning_bot
 astrbot_version: ">=4.29.1,<5"
