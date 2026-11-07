@@ -2219,3 +2219,43 @@ WS 帧解出来了，但只解到「谁、说了什么、什么时候」。要�
 
 - 外人的判断只靠「回过几次」，没有黑名单/敏感词过滤。
 - 群聊私信里的 @ 仍不当公开评论。
+
+
+## 38. 两边记忆互通（v0.15.0）
+
+### 38.1 之前是单向的
+
+`douyin/memory.py` 一直是两路：`remember()` 写自己的 `chat_log`（抖音私聊），
+`from_host()` 读 AstrBot 的 `platform_message_history`（QQ 历史）。
+后者只在「日常聊天」那条兜底路上被调用，判断模型走的 `agent.handle_douyin_event`
+只看 `chat_log` —— 所以她在抖音上说「我哪记得住你 QQ 说过什么」，
+其实是因为那份历史压根没喂给判断模型。
+
+反过来更彻底：你在 QQ 跟她说话，宿主的会话上下文里没有抖音的任何东西。
+
+### 38.2 QQ ← 抖音：`on_llm_request`
+
+插件注册 `@filter.on_llm_request()`，在请求模型前：
+
+1. 拿 `event.get_sender_id()`，不在 `_identity_map().values()` 里就直接返回
+   —— 只有主人的号才享受这条，别人的会话一个字都不塞。
+2. `_bridge_prompt_text()` 拼两段：每个 `dm_chat_allow/dm_targets/dm_self_names`
+   里的昵称取 `memory.recent(who, memory_bridge_lines)`；再 `store.recent(memory_bridge_items)`
+   拿最近看过的视频 `title + summary`。
+3. 追加到 `req.system_prompt`，日志 `记忆互通：给 QQ 会话带了 N 字抖音记忆`。
+
+没往 `platform_message_history` 里插伪造行 —— AstrBot 按 conversation 组装上下文，
+硬插会和宿主的状态机打架，而且重放/去重都不可控。
+
+### 38.3 抖音 ← QQ：给判断模型也喂
+
+`handle_douyin_event(evt, umo, extra_history=None)` 多一个入参，
+`_handle_dm_text` 里 `self.memory.from_host(qq_id, 6)` 塞进去。
+`qq_id = self._qq_of(who)` 提前到 agent 调用之前算（原来算在后面，
+只有兜底路用得上）。
+
+### 38.4 边界
+
+- 只读：两个方向都不写对方的表。
+- 长度可控：句数/条数都从配置来，`0` 就是关掉那一段。
+- 隐私：`dm_identity` 没配的号，两边的记忆都互不可见。
