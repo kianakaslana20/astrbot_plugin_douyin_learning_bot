@@ -2184,3 +2184,38 @@ WS 帧解出来了，但只解到「谁、说了什么、什么时候」。要�
 - 私信发送仍走界面（写接口要 `getBdTicketGuardHeader`，外部补不齐）。
 - 群聊私信不当私聊处理（`conversation_type != 1` 一律跳过）。
 - `@` 提及仍只能靠 UI 点选（API 直发会被服务端剥掉 sec_uid）。
+
+
+## 37. 评论回复：自动发 + 外人只回一次（v0.14.0）
+
+### 37.1 之前为什么别扭
+
+「刷完视频自己发评论」在 0.12.0 就自动了（`auto_comment`），但「有人回了我的评论」
+还挂在 `action_mode=ask` 上等人点头。同一件事两套口径，而且等人点头这一句
+往往来得比消息本身还晚。
+
+### 37.2 开关拆开
+
+| 开关 | 管什么 |
+|---|---|
+| `action_mode` | 分享、点赞这类「主动去动别人」的动作 |
+| `auto_comment` | 刷完自己发一条评论 |
+| `comment_reply_mode` | 回复别人给我的评论（auto/ask/off） |
+| `comment_reply_once_others` | 外人只回一次 |
+
+### 37.3 谁是「自己人」
+
+`_insider()` 依次比：`dm_targets`、`dm_chat_no_limit`、`dm_allow`、`dm_self_names`、
+`share_allowlist`，再拿 uid 反查一次昵称（`_name_of`）。命中任何一条就算自己人。
+
+### 37.4 计数
+
+`comment_reply_log(id, uid, who, cid, aweme_id, at)`，`reply_count(uid)` /
+`reply_hit(...)`。只在发送成功后 `reply_hit` —— 风控吞掉的那次不占额度，
+下次还能试。`/dy confirm` 那条路也守同一条规则（队列里过期的、外人超额的都
+会就地标成 done 并把理由写回）。
+
+### 37.5 仍缺
+
+- 外人的判断只靠「回过几次」，没有黑名单/敏感词过滤。
+- 群聊私信里的 @ 仍不当公开评论。
