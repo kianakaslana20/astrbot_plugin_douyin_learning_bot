@@ -457,6 +457,11 @@
         "description": "非自己人只回一次",
         "hint": "开（默认）：不在私信/分享白名单里的人，同一个人最多回一次评论；白名单里的自己人不限次数。关：所有人都不限次数（会像刷屏）",
         "default": true
+      },
+      "auto_share": {
+        "type": "bool",
+        "default": false,
+        "hint": "分享要不要也自动发（默认关：分享是发给别人，仍然先问；评论和点赞不受它影响）"
       }
     }
   },
@@ -805,6 +810,16 @@
         "description": "验证通过后自动重试这一轮",
         "default": true,
         "hint": "关掉就只是跳过这一轮，等下一轮再说"
+      },
+      "brief_mode": {
+        "type": "string",
+        "default": "actions",
+        "options": [
+          "off",
+          "actions",
+          "all"
+        ],
+        "hint": "跑完一轮推不推简报：off 不推 / actions 只有真发出去评论或分享才吱一声 / all 每轮都推完整简报"
       }
     }
   }
