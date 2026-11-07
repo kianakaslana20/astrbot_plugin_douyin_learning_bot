@@ -592,10 +592,12 @@ class Social:
         if allow is None:
             allow_list = None
         elif isinstance(allow, (list, tuple)):
-            allow_list = [str(a).strip() for a in allow if str(a).strip()]
+            allow_list = [str(a).strip() for a in allow if str(a).strip()] or None
         else:
             raw = str(allow or "").replace("，", ",").replace("、", ",")
-            allow_list = [x.strip() for x in raw.split(",") if x.strip()]
+            allow_list = [x.strip() for x in raw.split(",") if x.strip()] or None
+        # 空列表 = 不校验：自动回话那条路传 allow=[]，谁能聊已经由 dm_chat_allow 判过了，
+        # 这里再按"空名单"拦一次，就会变成"模型想好了话却永远发不出去"。
         return await self.im.send_dm(
             page, target, text, allow=allow_list, readback=readback
         )
