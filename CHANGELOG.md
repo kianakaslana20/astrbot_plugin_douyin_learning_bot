@@ -1,3 +1,30 @@
+## 0.13.0 —— 私信和通知都不再从界面上「猜」
+
+WS 那一路只能告诉你有动静：帧里没有会话名、没有评论 id，
+真正的正文还是回头去界面上按 DOM 抠。界面一变（面板没渲染完、消息被折叠），
+同一条消息就只剩一条 `ws_evidence` 记录，看着像收到了、其实什么都没做。
+
+这一版把「读」换成接口，界面彻底退成兜底：
+
+- `douyin/imapi.py`：`POST imapi.douyin.com/v1/message/get_message_by_init`，
+  自己拼 protobuf 信封（cmd=2043），按会话取最近消息 —— 发送者 uid、正文、
+  毫秒时间戳、`server_message_id` 全在，`mine` 直接由 sender==my_uid 算出来，
+  不用再从「头像在左半边还是右半边」猜谁发的。
+- `douyin/noticeapi.py`：`aweme/v1/web/notice/`，四个分组都读，
+  列表在 `notice_list_v2`（不是 `notice_list`），**带真实 `comment_id`**。
+- `_http_scan()`：WS 只当唤醒信号，唤醒后按游标取增量；
+  游标落在 `plugin_data/http_state.json`（`im` 是按会话的毫秒时间戳，`notice` 是已处理的 nid 列表）。
+- 首轮（baseline）只建游标，不回积压 —— 装上新版本不会突然给旧消息挨个回一遍。
+- 接口失败照旧回界面读，日志写 `HTTP 增量拉取失败（走界面兜底）`，栈进 `event_errors.log`。
+- 通知带 cid 的走「按 cid 回复」，不再退化成「在视频下发一条 @」。
+- 开关：`inbox.dm_http` / `inbox.notice_http`（默认都开）、`inbox.dm_http_limit`（默认 20）。
+
+顺手修掉两个一直在报的 bug：`_handle_dm_share_event` 里
+`_notify_text(umo, text, umo=umo)` 重复传 umo 直接 TypeError（分享总结发不出去），
+以及 `NoticeApi.items()` 返回整包 dict 却被当成列表迭代。
+
+测试 110 项全过（新增 `tests/test_http_incremental.py` 12 项）。
+
 ## 0.12.0 —— 刷完自己评论，不再等一句「/dy do」
 
 `auto_comment` 这个开关从 0.6 就在配置里，但**从来没接过线**：真正决定发不发的只有
