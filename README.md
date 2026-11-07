@@ -773,3 +773,22 @@ MIT，见 [LICENSE](LICENSE)。
 ```
 
 想让分享也别问，把 `action_mode` 改成 `auto`；想全停就改 `off`。
+
+
+## 四点零八、私信和通知改走接口（v0.13.0）
+
+以前「读到私信」= 打开面板 + 抠 DOM。面板慢一拍、消息被折叠，就等于没收到。
+现在改成接口读、界面兜底：
+
+| 读什么 | 走哪 | 拿得到什么 |
+|---|---|---|
+| 私信 | `imapi.douyin.com/v1/message/get_message_by_init`（cmd=2043） | 发送者 uid、正文、毫秒时间戳、`server_message_id`、`mine` |
+| 评论/@/通知 | `aweme/v1/web/notice/`（`notice_list_v2`） | 真实 `comment_id`、被评论的作品 id、楼层父 id |
+
+- WS 只当「有动静」的唤醒信号；真正的内容按游标取增量。
+- 游标在 `plugin_data/http_state.json`，首轮只记账不回积压。
+- 接口读不到就回界面读，日志会写 `HTTP 增量拉取失败（走界面兜底）`。
+- 开关：`inbox.dm_http`、`inbox.notice_http`（默认开），`inbox.dm_http_limit`（每次取几个会话，默认 20）。
+
+带 cid 的通知走「按 cid 回复」，不再退化成「在视频下发一条 @」——
+这才是评论区的正常回复。
