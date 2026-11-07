@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -25,6 +26,27 @@ _EVENT_RULES = """现在是抖音私信/评论的场景。下面是一条事件�
 - reason 用中文一句话说清为什么这么定。
 
 只输出 JSON：{"reply": true/false, "text": "...", "reason": "..."}"""
+
+_CARD_RULES = """下面是这一轮看过的几条抖音视频（标题 + 你看完写的摘要 + 关键词）。
+把每条压缩成一张「知识点卡片」，这是你以后聊天时能拿来说的东西，不是给用户看的简报。
+
+规则：
+- topic：6~14 个字，说清这条讲的是什么（「临终意识为什么最后听到声音」）。
+- take：用第一人称写一句你自己的想法或记住的结论，20~40 字，像人会说的话，
+  可以带态度（「我以前以为…现在觉得…」），不要复述摘要，不要「本视频讲述了」。
+- 只保留真有信息量的；纯娱乐、广告、看不懂的跳过（不要放进结果里）。
+
+只输出 JSON 数组：[{"aweme_id":"...","topic":"...","take":"..."}]"""
+
+_REVIEW_RULES = """下面是你这两天刷抖音积累的知识点卡片，以及你最近跟人聊的天。
+写一段「这几天我大概想明白了什么」，这是要写进你自己档案的，不是报告。
+
+规则：
+- 第一人称，3~6 句，不要分点列举，不要写「根据卡片」这种话。
+- 挑真正让你看法有变化的 1~3 件，能说出「以前我以为…现在觉得…」最好。
+- 别复述视频标题，别写「学到了很多」。就写你现在的想法。
+
+只输出那段话本身，不要 JSON，不要引号。"""
 
 _ROUND_RULES = """现在是抖音刷视频的场景。你要决定：这一轮值不值得去刷。
 
@@ -53,6 +75,25 @@ def _loads(text: str) -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _loads_list(text: str) -> list[dict]:
+    """模型返回 JSON 数组时用它（``_loads`` 只认对象）。"""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    fence = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", raw, re.S)
+    if fence:
+        raw = fence.group(1)
+    else:
+        m = re.search(r"\[.*\]", raw, re.S)
+        if m:
+            raw = m.group(0)
+    try:
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return []
+    return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
 
 def _clean_text(text: str, limit: int = 120) -> str:
@@ -151,6 +192,94 @@ class DouyinAgent:
             decision["reason"] = decision["reason"] or "模型说回，但没给话"
         await self._record(evt, decision)
         return decision
+
+    async def digest_cards(self, items: list[dict], umo: str = "") -> list[dict]:
+        """一轮看完，把摘要压成知识点卡片。items: [{aweme_id,title,summary,keywords}]"""
+        rows = [i for i in (items or []) if str(i.get("summary") or "").strip()]
+        if not rows:
+            logger.info("agent: 卡片提炼没有带摘要的条目")
+            return []
+        body = "\n".join(
+            [
+                f"- aweme_id={i.get('aweme_id')}｜标题：{str(i.get('title') or '')[:60]}"
+                f"｜摘要：{str(i.get('summary') or '')[:260]}"
+                f"｜关键词：{str(i.get('keywords') or '')[:60]}"
+                for i in rows[:8]
+            ]
+        )
+        provider = None
+        try:
+            provider = await self.voice.provider(umo) if self.voice else None
+        except Exception:  # noqa: BLE001
+            provider = None
+        if provider is None:
+            logger.info("agent: 卡片提炼没有可用的模型")
+            return []
+        system = _CARD_RULES
+        try:
+            persona = await self.voice.persona_prompt(umo) if self.voice else ""
+        except Exception:  # noqa: BLE001
+            persona = ""
+        if persona:
+            system = f"{persona}\n\n{_CARD_RULES}"
+        timeout = float(getattr(self.settings, "voice_timeout_s", 60) or 60)
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(prompt=body, contexts=[], system_prompt=system),
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"agent: 卡片提炼失败（{type(exc).__name__}: {exc}）")
+            return []
+        out: list[dict] = []
+        for row in _loads_list(getattr(resp, "completion_text", "") or ""):
+            aweme = str(row.get("aweme_id") or "").strip()
+            topic = _clean_text(row.get("topic") or "", 40)
+            take = _clean_text(row.get("take") or "", 120)
+            if not (aweme and topic and take):
+                continue
+            out.append({"aweme_id": aweme, "topic": topic, "take": take})
+        return out
+
+    async def review_day(self, cards: list[dict], chats: list[str], umo: str = "") -> str:
+        """把这些卡片和她最近说的话，揉成一段「这几天我想明白了什么」。"""
+        if not cards and not chats:
+            return ""
+        body = "\n".join(
+            ["最近的知识点卡片："]
+            + [f"- {c.get('topic')}：{c.get('take')}" for c in (cards or [])[:12]]
+            + ["", "最近跟人聊的："]
+            + [str(x)[:120] for x in (chats or [])[:10]]
+        )
+        provider = None
+        try:
+            provider = await self.voice.provider(umo) if self.voice else None
+        except Exception:  # noqa: BLE001
+            provider = None
+        if provider is None:
+            logger.info("agent: 复盘没有可用的模型（umo 是空的或该会话没配人格）")
+            return ""
+        system = _REVIEW_RULES
+        try:
+            persona = await self.voice.persona_prompt(umo) if self.voice else ""
+        except Exception:  # noqa: BLE001
+            persona = ""
+        if persona:
+            system = f"{persona}\n\n{_REVIEW_RULES}"
+        timeout = float(getattr(self.settings, "voice_timeout_s", 60) or 60)
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(prompt=body, contexts=[], system_prompt=system),
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"agent: 复盘失败（{type(exc).__name__}: {exc}）")
+            return ""
+        text = str(getattr(resp, "completion_text", "") or "").strip()
+        if not text:
+            logger.info("agent: 复盘模型回了空内容")
+            return ""
+        return _clean_text(text, 600)
 
     async def judge_round(self, info: dict, umo: str = "") -> dict:
         body = "\n".join(
