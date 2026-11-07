@@ -595,6 +595,21 @@
         "type": "int",
         "description": "自主刷每天最多看几条",
         "default": 8
+      },
+      "dm_http": {
+        "type": "bool",
+        "default": true,
+        "description": "私信改走 HTTP 增量（WS 只当唤醒信号，界面兜底）"
+      },
+      "dm_http_limit": {
+        "type": "int",
+        "default": 20,
+        "description": "每次私信 HTTP 拉取的会话条数上限（1-50）"
+      },
+      "notice_http": {
+        "type": "bool",
+        "default": true,
+        "description": "评论/@ 通知改走 HTTP（能拿到真实 comment_id）"
       }
     }
   },
