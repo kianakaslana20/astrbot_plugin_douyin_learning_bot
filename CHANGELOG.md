@@ -1,3 +1,22 @@
+## 0.14.0 —— 有人回我的评论，自己去回；外人只回一次
+
+之前「回复我评论的人」还要 `/dy do` 放行，跟「刷完自己发评论」是两套口径。
+现在评论回复有自己的开关 `comment_reply_mode`：
+
+- `auto`（默认）：模型判断要回就直接发，带真实 cid 挂在那条评论下面。
+- `ask`：进待确认队列，`/dy confirm` 才发（老行为）。
+- `off`：只记模型判断，一条都不发。
+
+**次数限制**：`comment_reply_once_others`（默认开）—— 不在私信/日常聊天/分享/@
+白名单里的人，同一个 uid 最多回一次；白名单里的自己人不限次数。
+计数落新表 `comment_reply_log(uid, who, cid, aweme_id, at)`，发送成功才记，
+被风控吞掉的下次还能重试。
+
+顺手把 `_handle_dm_share_event` / `_mention_work` 里 `_notify_text(umo, text, umo=umo)`
+重复传 umo 的 TypeError 修掉了 —— 从 11-05 起分享总结一直发不出去。
+
+测试：`_test_dy_reply_mode.py` 22 项、`tests/` 110 项全过。
+
 ## 0.13.1 —— 空名单就是「不校验」
 
 自动回话那条路传的是 `allow=[]`，本意「不校验」——能不能跟这个人聊，
