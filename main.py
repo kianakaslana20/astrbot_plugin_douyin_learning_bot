@@ -937,6 +937,7 @@ class DouyinLearningBot(Star):
             job.error = result.error
             return result
         try:
+            self._last_action_lines = []
             extra = await self._auto_actions(result)
             if extra:
                 result.text = (result.text or "") + extra
@@ -952,14 +953,40 @@ class DouyinLearningBot(Star):
             logger.warning("写操作阶段失败：%s", exc)
         return result
 
+    def _brief_mode(self) -> str:
+        """简报模式：off 不推 / actions 只在真动了手时推一句 / all 推完整简报。"""
+        mode = str(getattr(self.settings, "brief_mode", "actions") or "actions").lower()
+        return mode if mode in {"off", "actions", "all"} else "actions"
+
+    def _brief_of(self, result) -> str:
+        """按 brief_mode 决定这轮要推什么；空串表示不推。"""
+        if not getattr(self.settings, "notify_done", True):
+            return ""
+        mode = self._brief_mode()
+        if mode == "off":
+            return ""
+        if mode == "all":
+            return getattr(result, "text", "") or ""
+        lines = list(getattr(self, "_last_action_lines", []) or [])
+        if not lines:
+            return ""                      # 这轮只是看看，什么都没发出去：不吵人
+        head = "这轮动了手："
+        return head + "\n" + "\n".join(lines)
+
     async def _notify_job(self, job: Job) -> None:
         """任务结束时通知用户：成功推简报，失败推原因。"""
         result = job.result
         if job.ok and result is not None and getattr(result, "text", ""):
             if not self.settings.notify_done:
                 return
+            payload = self._brief_of(result)
+            if not payload:
+                return
+            if not str(job.umo or "").strip():
+                logger.info("简报没发：这个任务没有会话（多半是自主刷且没配 push_target）")
+                return
             try:
-                await self.context.send_message(job.umo, self._chain(result))
+                await self.context.send_message(job.umo, self._chain_text(result, payload))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("推送简报失败：%s", exc)
             return
@@ -1139,7 +1166,7 @@ class DouyinLearningBot(Star):
                 summary = str(row.get("summary") or "").strip()
                 if not summary:
                     continue
-                title = str(row.get("title") or "").strip()[:40]
+                title = str(row.get("title") or row.get("desc") or "").strip()[:40]
                 seen.append(f"- {title or '（无标题）'}：{summary[:120]}")
             if seen:
                 blocks.append(
@@ -1725,12 +1752,65 @@ class DouyinLearningBot(Star):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自主刷异常：%s", exc)
 
+    def _auto_state_path(self):
+        return self.data_dir / "auto_state.json"
+
+    def _auto_state_load(self) -> None:
+        """把「今天已经自主刷了几轮 / 上次刷完是什么时候」从盘上读回来。
+
+        这些原来只存在内存里 —— 插件一重载（/dy reload 或宿主重启）就清零，
+        于是「距上次刷完是否够久」永远成立，每 5 分钟就自己刷一轮。
+        """
+        if getattr(self, "_auto_state_loaded", False):
+            return
+        self._auto_state_loaded = True
+        raw = {}
+        try:
+            raw = json.loads(self._auto_state_path().read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        day = str(raw.get("day") or "")
+        self._auto_day = day
+        try:
+            self._auto_rounds_today = int(raw.get("rounds") or 0)
+        except Exception:  # noqa: BLE001
+            self._auto_rounds_today = 0
+        try:
+            self._auto_items_today = int(raw.get("items") or 0)
+        except Exception:  # noqa: BLE001
+            self._auto_items_today = 0
+        try:
+            self._last_round_at = float(raw.get("last_round_at") or 0.0)
+        except Exception:  # noqa: BLE001
+            self._last_round_at = 0.0
+
+    def _auto_state_save(self) -> None:
+        try:
+            self._auto_state_path().write_text(
+                json.dumps(
+                    {
+                        "day": getattr(self, "_auto_day", ""),
+                        "rounds": getattr(self, "_auto_rounds_today", 0),
+                        "items": getattr(self, "_auto_items_today", 0),
+                        "last_round_at": round(float(getattr(self, "_last_round_at", 0.0) or 0.0), 3),
+                    },
+                    ensure_ascii=False,
+                ),
+                "utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("自主刷：状态没能落盘（%s）", exc)
+
     def _auto_budget_ok(self) -> tuple[bool, str]:
+        self._auto_state_load()
         day = time.strftime("%Y-%m-%d")
         if day != getattr(self, "_auto_day", ""):
             self._auto_day = day
             self._auto_rounds_today = 0
             self._auto_items_today = 0
+            self._auto_state_save()
         cap_r = int(getattr(self.settings, "auto_rounds_per_day", 4) or 0)
         cap_i = int(getattr(self.settings, "auto_items_per_day", 8) or 0)
         if cap_r and self._auto_rounds_today >= cap_r:
@@ -1764,7 +1844,11 @@ class DouyinLearningBot(Star):
         if not decision.get("run") or take <= 0:
             logger.info("自主刷：模型判断这轮不用刷（%s）", decision.get("reason") or "没给理由")
             return
-        job = self.jobs.submit("round", self._last_umo or "", take)
+        umo = self._push_target or self._last_umo or ""
+        if not umo:
+            # 没有可推送的会话：照样刷，只是不发简报（别用空 umo 去 send_message，会抛「不合法的 session」）
+            logger.info("自主刷：没有推送目标（push_target 没配、也没聊过），这轮只刷不推")
+        job = self.jobs.submit("round", umo, take)
         if job is None:
             logger.info("自主刷：队列满了，这轮放弃")
             return
@@ -2336,6 +2420,8 @@ class DouyinLearningBot(Star):
             kinds.add("comment")
         if getattr(self.settings, "auto_like", False):
             kinds.add("like")
+        if getattr(self.settings, "auto_share", False):
+            kinds.add("share")
         return kinds
 
     async def _auto_actions(self, result: RoundResult) -> str:
@@ -2353,6 +2439,8 @@ class DouyinLearningBot(Star):
         if auto:
             try:
                 lines = await self._do_actions(result.analyzed, kinds=auto)
+                self._last_action_lines = list(lines or [])
+                self._last_action_lines = list(lines or [])
             except HumanVerifyNeeded:
                 raise                  # 交给 _run_job：搬窗口、叫人、验过再重试
             except Exception as exc:  # noqa: BLE001
@@ -2364,6 +2452,8 @@ class DouyinLearningBot(Star):
             if not lines:
                 return tail
             return "\n\n写操作回执：\n" + "\n".join(lines) + tail
+        self._last_action_lines = list(lines or [])
+        self._last_action_lines = list(lines or [])
         if not lines:
             return ""
         return "\n\n写操作回执：\n" + "\n".join(lines)
@@ -3349,6 +3439,12 @@ class DouyinLearningBot(Star):
         if parts and (parts[0].startswith("/") or parts[0].lower() in {"dy", "抖音"}):
             parts = parts[1:]
         return parts
+
+    def _chain_text(self, result: RoundResult, text: str) -> MessageChain:
+        """简报只换文案、保留拼图（actions 模式下只发一行也带图没意义，就不带）。"""
+        if text == (result.text or ""):
+            return self._chain(result)
+        return MessageChain([Plain(text or "（没有内容）")])
 
     @staticmethod
     def _chain(result: RoundResult) -> MessageChain:
