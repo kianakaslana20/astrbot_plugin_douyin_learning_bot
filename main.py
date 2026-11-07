@@ -1835,10 +1835,13 @@ class DouyinLearningBot(Star):
                 return "没想出合适的回法，不硬发"
         if not entry.aweme_id:
             return "视频 id 待补，保留通知记录"
-        mode = getattr(self.settings, "action_mode", "ask")
+        mode = self._reply_mode()
         if mode == "off":
-            return "写操作关闭，只保留模型判断"
+            return "评论回复模式 off，只保留模型判断"
         uid = str(entry.extra.get("from_uid") or entry.who)
+        blocked = await self._reply_blocked(uid, entry.who or "")
+        if blocked:
+            return blocked
         pending = await self.store.inbox_pending("comment_reply", 200)
         for row in pending:
             payload = json.loads(row.get("payload") or "{}")
@@ -1847,14 +1850,65 @@ class DouyinLearningBot(Star):
         payload = {"uid": uid, "who": entry.who, "aweme_id": entry.aweme_id,
                    "comment_id": str(entry.extra.get("comment_id") or ""),
                    "text": text0, "created_at": time.time()}
-        if mode in {"ask", "confirm"}:
+        if mode == "ask":
             await self.store.inbox_add("comment_reply", entry.key, src=entry.who,
                                       payload=json.dumps(payload, ensure_ascii=False))
             await self._notify_text(umo, f"待确认评论回复 · {entry.who}\n{text0}\n/dy confirm 确认（12 小时有效）")
             return "评论回复已入待确认队列"
-        if payload["comment_id"]:
-            return await self._send_comment_reply(payload)
-        return await self._send_mention_comment(payload)
+        # 计数在 _send_comment_reply / _send_mention_comment 里落，这里别再记一遍
+        return (await self._send_comment_reply(payload)
+                if payload["comment_id"] else await self._send_mention_comment(payload))
+
+    def _insider(self, target: str, uid: str = "") -> bool:
+        """这个人算不算「自己人」：私信/日常聊天/分享/@ 白名单里出现过的都算。
+
+        自己人回评论不限次数；不在名单里的外人只回一次（避免跟陌生人吵起来）。
+        """
+        t = str(target or "").strip()
+        u = str(uid or "").strip()
+        if not t and not u:
+            return False
+        names = []
+        for attr in ("dm_targets", "dm_chat_no_limit", "dm_allow", "dm_self_names"):
+            raw = getattr(self.settings, attr, "") or ""
+            names += [x.strip() for x in str(raw).replace("，", ",").replace("、", ",").split(",") if x.strip()]
+        try:
+            names += list(self.settings.share_allowlist or [])
+        except Exception:  # noqa: BLE001
+            pass
+        for n in names:
+            if not n:
+                continue
+            if t and (n == t or n in t or t in n):
+                return True
+            if u and n == u:
+                return True
+        # uid 反查名字，再比一次（对方昵称带后缀、我们记录的是短名时也能对上）
+        if u:
+            by_uid = self._name_of(u) if hasattr(self, "_name_of") else ""
+            if by_uid and t and (by_uid == t or by_uid in t or t in by_uid):
+                return True
+        return False
+
+    def _reply_mode(self) -> str:
+        """评论/私信回复怎么发：auto 直接发，ask 进队列，off 只记判断。"""
+        mode = str(getattr(self.settings, "comment_reply_mode", "auto") or "auto").lower()
+        return mode if mode in {"auto", "ask", "off"} else "auto"
+
+    async def _reply_blocked(self, uid: str, who: str) -> str:
+        """非自己人只回一次的闸门：返回拒绝理由，空串表示放行。"""
+        if not getattr(self.settings, "comment_reply_once_others", True):
+            return ""
+        if self._insider(who, uid):
+            return ""
+        try:
+            used = await self.store.reply_count(uid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查评论回复次数失败（放行）：%s", exc)
+            return ""
+        if used >= 1:
+            return f"「{who or uid}」不是自己人，已经回过 {used} 次，不再回"
+        return ""
 
     async def _send_mention_comment(self, payload):
         """@ 提醒的公开回法：在视频下发一条评论 @ 回对方。
@@ -1873,6 +1927,8 @@ class DouyinLearningBot(Star):
         res = await self.social.comment(aweme, text, [who] if who else [])
         if res.ok:
             await self.limits.hit_async("comment")
+            await self.store.reply_hit(str(payload.get("uid") or who or ""), who, "",
+                                       aweme)
             return "回了：" + text
         return "评论发送未确认：" + str(getattr(res, "detail", ""))
 
@@ -1886,12 +1942,15 @@ class DouyinLearningBot(Star):
         res = await self.social.reply_comment(payload["aweme_id"], cid, payload["text"])
         if res.ok:
             await self.limits.hit_async("comment")
+            await self.store.reply_hit(str(payload.get("uid") or payload.get("who") or ""),
+                                       str(payload.get("who") or ""), cid,
+                                       str(payload.get("aweme_id") or ""))
             return "回了：" + payload["text"]
         return "评论发送未确认：" + res.detail
 
     async def _confirm_comment_replies(self):
-        if getattr(self.settings, "action_mode", "ask") == "off":
-            return ["写操作关闭，评论队列保留"]
+        if self._reply_mode() == "off":
+            return ["评论回复模式 off，队列保留"]
         lock = getattr(self, "_comment_confirm_lock", None)
         if lock is None:
             lock = asyncio.Lock()
@@ -1900,6 +1959,12 @@ class DouyinLearningBot(Star):
             out = []
             for row in await self.store.inbox_pending("comment_reply", 20):
                 payload = json.loads(row.get("payload") or "{}")
+                blocked = await self._reply_blocked(str(payload.get("uid") or ""),
+                                                    str(payload.get("who") or ""))
+                if blocked:
+                    await self.store.inbox_done("comment_reply", row["key"], blocked)
+                    out.append(blocked)
+                    continue
                 if time.time() - float(payload.get("created_at") or 0) > 43200:
                     line = "评论确认已过期"
                 else:
