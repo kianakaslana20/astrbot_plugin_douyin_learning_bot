@@ -224,6 +224,7 @@ class Settings:
     # 写操作
     auto_like: bool = False
     auto_comment: bool = True
+    auto_share: bool = False      # ask 模式下分享要不要也自动做（默认仍问）
     comment_reply_mode: str = "auto"   # auto / ask / off
     comment_reply_once_others: bool = True   # 非自己人只回一次
 
@@ -297,6 +298,7 @@ class Settings:
     # 后台 / 通知
     notify_start: bool = False     # 一轮开跑时先说一句（后台循环容易刷屏，默认关）
     notify_done: bool = True       # 跑完推结果
+    brief_mode: str = "actions"  # off / actions（只有真动手才说） / all
     notify_error: bool = True      # 失败推原因
     notify_login: bool = True      # 需要登录时主动叫（发二维码截图）
     login_wait_min: int = 6        # 叫了之后等扫码多少分钟
@@ -371,7 +373,8 @@ class Settings:
             keep_media=_as_bool(md.get("keep_media"), False),
             ffmpeg_path=_as_str(md.get("ffmpeg_path"), ""),
             auto_like=_as_bool(ac.get("auto_like"), False),
-            auto_comment=_as_bool(ac.get("auto_comment"), False),
+            auto_comment=_as_bool(ac.get("auto_comment"), True),
+            auto_share=_as_bool(ac.get("auto_share"), False),
             comment_reply_mode=(
                 _as_str(ac.get("comment_reply_mode"), "auto").lower()
                 if _as_str(ac.get("comment_reply_mode"), "auto").lower() in {"auto", "ask", "off"}
@@ -439,6 +442,7 @@ class Settings:
         bg = _section(config, "notify") or _section(config, "background")
         out.notify_start = _as_bool(bg.get("notify_start"), False)
         out.notify_done = _as_bool(bg.get("notify_done"), True)
+        out.brief_mode = (_as_str(bg.get("brief_mode"), "actions").lower() if _as_str(bg.get("brief_mode"), "actions").lower() in {"off", "actions", "all"} else "actions")
         out.notify_error = _as_bool(bg.get("notify_error"), True)
         out.notify_login = _as_bool(bg.get("notify_login"), True)
         out.login_wait_min = _as_int(bg.get("login_wait_min"), 6, 1, 60)
