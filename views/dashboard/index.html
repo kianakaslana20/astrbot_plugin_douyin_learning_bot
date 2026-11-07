@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>抖音学习助手 · 控制台</title>
+<style>
+  :root{
+    --bg:#eef3fa;--panel:#fff;--fg:#16202e;--muted:#6b7c93;--line:#dbe4f0;--field:#f6f9fe;
+    --accent:#2f6feb;--soft:#e8f0ff;--ok:#1f9d6b;--warn:#c2410c;--err:#dc2626;
+    --sh:0 1px 2px rgba(22,45,90,.06),0 12px 28px -16px rgba(22,45,90,.22);
+  }
+  [data-theme="dark"]{
+    --bg:#0b1119;--panel:#111a26;--fg:#e6eefb;--muted:#8ea2bd;--line:#1e2b3d;--field:#0f1722;
+    --accent:#64a0ff;--soft:#14233a;--ok:#4ade80;--warn:#fb923c;--err:#f87171;
+    --sh:0 1px 2px rgba(0,0,0,.5),0 16px 36px -22px rgba(0,0,0,.9);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.65 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 18px 80px}
+  header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px}
+  header h1{font-size:19px;margin:0}
+  .pill{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);
+    background:var(--panel);color:var(--muted)}
+  .pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,var(--line))}
+  .pill.bad{color:var(--err);border-color:color-mix(in srgb,var(--err) 40%,var(--line))}
+  .sp{flex:1}
+  button{font:inherit;cursor:pointer;border-radius:10px;padding:7px 12px;border:1px solid var(--line);
+    background:var(--panel);color:var(--fg);transition:.15s;white-space:nowrap}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.mini{padding:3px 8px;font-size:12px;border-radius:8px}
+  button.danger{color:var(--err)}
+  nav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+  nav a{padding:6px 13px;border-radius:10px;text-decoration:none;color:var(--muted);
+    border:1px solid transparent;font-size:13px;cursor:pointer}
+  nav a.on{background:var(--panel);color:var(--fg);border-color:var(--line);box-shadow:var(--sh)}
+  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
+    box-shadow:var(--sh)}
+  .card h3{margin:0 0 10px;font-size:13px;color:var(--muted);font-weight:600;letter-spacing:.02em}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-size:13px}
+  .kv b{font-weight:600}
+  .bar{height:7px;border-radius:999px;background:var(--field);overflow:hidden;margin-top:4px}
+  .bar i{display:block;height:100%;background:var(--accent);border-radius:999px}
+  .bar i.warn{background:var(--warn)}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  label.f{display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:6px 0;border-bottom:1px dashed var(--line);font-size:13px}
+  label.f:last-child{border-bottom:0}
+  label.f span{color:var(--fg)}
+  label.f small{display:block;color:var(--muted);font-size:11px}
+  input[type=text],input[type=number],select,textarea{
+    font:inherit;color:var(--fg);background:var(--field);border:1px solid var(--line);
+    border-radius:9px;padding:6px 9px;min-width:120px}
+  textarea{width:100%;min-height:120px;line-height:1.6}
+  .switch{position:relative;width:40px;height:22px;flex:0 0 auto}
+  .switch input{opacity:0;width:0;height:0}
+  .switch i{position:absolute;inset:0;background:var(--field);border:1px solid var(--line);
+    border-radius:999px;transition:.18s}
+  .switch i:after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;
+    background:var(--muted);top:2px;left:2px;transition:.18s}
+  .switch input:checked + i{background:var(--soft);border-color:var(--accent)}
+  .switch input:checked + i:after{left:20px;background:var(--accent)}
+  ul.list{list-style:none;margin:0;padding:0}
+  ul.list li{padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}
+  ul.list li:last-child{border-bottom:0}
+  .t{color:var(--muted);font-size:11px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .tag{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--soft);color:var(--accent)}
+  .tag.bad{background:color-mix(in srgb,var(--err) 18%,var(--panel));color:var(--err)}
+  #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;background:var(--fg);
+    color:var(--bg);padding:9px 16px;border-radius:11px;font-size:13px;opacity:0;
+    transition:.2s;pointer-events:none;max-width:80vw}
+  #toast.on{opacity:.95}
+  .muted{color:var(--muted)}
+  .sec{display:none}
+  .sec.on{display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>抖音学习助手 · 控制台</h1>
+    <span class="pill" id="ver">v?</span>
+    <span class="pill" id="p-login">登录？</span>
+    <span class="pill" id="p-quiet" hidden>静默时段</span>
+    <div class="sp"></div>
+    <button id="btn-refresh">刷新</button>
+    <button id="btn-window" class="mini">把窗口提到前台</button>
+    <button id="btn-theme" class="mini">切换主题</button>
+  </header>
+
+  <nav>
+    <a data-sec="overview" class="on">概览</a>
+    <a data-sec="control">控制</a>
+    <a data-sec="learn">学习</a>
+    <a data-sec="queue">队列</a>
+    <a data-sec="act">动作</a>
+  </nav>
+
+  <section class="sec on" id="sec-overview">
+    <div class="grid">
+      <div class="card"><h3>今日额度</h3><div id="limits"></div></div>
+      <div class="card"><h3>自主刷</h3><div id="auto"></div></div>
+      <div class="card"><h3>事件守护</h3><div id="events"></div></div>
+      <div class="card"><h3>浏览器</h3><div id="browser"></div></div>
+    </div>
+    <div class="card" style="margin-top:12px"><h3>最近动作</h3><ul class="list" id="actions"></ul></div>
+  </section>
+
+  <section class="sec" id="sec-control">
+    <div class="grid">
+      <div class="card"><h3>刷视频</h3><div data-group="刷视频"></div></div>
+      <div class="card"><h3>写操作</h3><div data-group="写操作"></div></div>
+      <div class="card"><h3>额度</h3><div data-group="额度"></div></div>
+      <div class="card"><h3>简报与推送</h3><div data-group="简报"></div></div>
+      <div class="card"><h3>私信</h3><div data-group="私信"></div></div>
+      <div class="card"><h3>学习</h3><div data-group="学习"></div></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="row"><button class="primary" id="btn-save">保存配置</button>
+        <span class="muted" id="save-note">改完点保存，立即生效（不用重启）</span></div>
+    </div>
+  </section>
+
+  <section class="sec" id="sec-learn">
+    <div class="grid">
+      <div class="card"><h3>知识点卡片 <span class="tag" id="card-count">0</span></h3>
+        <ul class="list" id="cards"></ul></div>
+      <div class="card"><h3>人格档案 persona_notes.md</h3>
+        <textarea id="notes" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="btn-notes">保存档案</button>
+          <button id="btn-review">现在复盘一次</button>
+        </div></div>
+    </div>
+  </section>
+
+  <section class="sec" id="sec-queue">
+    <div class="grid">
+      <div class="card"><h3>待回评论</h3><ul class="list" id="qc"></ul>
+        <div class="row" style="margin-top:10px"><button class="primary" id="btn-confirm">立刻回掉</button></div></div>
+      <div class="card"><h3>待发私信</h3><ul class="list" id="qd"></ul>
+        <div class="row" style="margin-top:10px"><button class="primary" id="btn-dmflush">发出去</button></div></div>
+      <div class="card"><h3>收件箱</h3><div id="inbox"></div></div>
+    </div>
+  </section>
+
+  <section class="sec" id="sec-act">
+    <div class="grid">
+      <div class="card"><h3>手动</h3>
+        <div class="row"><button class="primary" id="btn-round">立刻刷一轮</button></div>
+        <p class="muted" style="font-size:12px;margin:10px 0 0">
+          走的是同一条流水线：下载 → 抽帧 → 转写 → 模型简报 → 自动评论/分享（按开关）。</p>
+        <div class="row" style="margin-top:12px"><button id="btn-probe">检查两条接口通道</button></div>
+      </div>
+      <div class="card"><h3>发一条私信</h3>
+        <label class="f"><span>发给</span><input type="text" id="dm-who" placeholder="昵称或 uid" /></label>
+        <label class="f"><span>内容</span><input type="text" id="dm-text" placeholder="说点什么" /></label>
+        <div class="row" style="margin-top:10px"><button class="primary" id="btn-dm">发</button>
+          <span class="muted" style="font-size:12px">只发给白名单里的人</span></div>
+      </div>
+    </div>
+  </section>
+</div>
+<div id="toast"></div>
+
+<script>
+const PLUGIN = "astrbot_plugin_douyin_learning_bot";
+const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
+const BASE = "/api/plug/" + PLUGIN;
+
+function toast(msg, bad) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.style.background = bad ? "var(--err)" : "var(--fg)";
+  el.classList.add("on");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove("on"), 2600);
+}
+
+async function api(path, body) {
+  const endpoint = BASE + path;
+  if (bridge && bridge.apiGet) {
+    try {
+      return body === undefined ? await bridge.apiGet(endpoint) : await bridge.apiPost(endpoint, body);
+    } catch (e) { /* 退回直连 */ }
+  }
+  const r = await fetch(endpoint, body === undefined
+    ? { credentials: "include" }
+    : { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body) });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+// ---------------- 分组与渲染 ----------------
+const GROUPS = {
+  "刷视频": ["loop_enabled", "loop_interval_min", "inbox.autonomous_round",
+             "inbox.auto_rounds_per_day", "inbox.auto_items_per_day", "feed.want"],
+  "写操作": ["actions.action_mode", "actions.auto_comment", "actions.auto_like",
+             "actions.auto_share", "actions.comment_reply_mode",
+             "actions.comment_reply_once_others", "actions.action_delay_s",
+             "actions.max_actions_per_round", "actions.comment_template"],
+  "额度": ["rate.rate_comment_per_day", "rate.rate_like_per_day", "rate.rate_share_per_day",
+           "rate.rate_dm_per_hour", "rate.rate_dm_per_day",
+           "rate.rate_dm_out_per_hour", "rate.rate_dm_out_per_day", "rate.quiet_hours"],
+  "简报": ["notify.brief_mode", "notify.notify_done", "push_target"],
+  "私信": ["inbox.dm_chat_enabled", "inbox.dm_chat_allow", "inbox.dm_targets",
+           "inbox.dm_self_names", "inbox.dm_identity", "inbox.dm_http", "inbox.notice_http",
+           "inbox.agent_enabled"],
+  "学习": ["inbox.knowledge_enabled", "inbox.knowledge_cards_in_prompt",
+           "inbox.knowledge_review_daily", "inbox.memory_bridge",
+           "inbox.memory_bridge_lines", "inbox.memory_bridge_items",
+           "understand.asr_backend", "understand.asr_model", "understand.asr_api_base"],
+};
+
+let STATE = null;
+const dirty = new Map();
+
+function fieldEl(path, spec, value) {
+  const type = (spec && spec.type) || "str";
+  const label = (spec && spec.label) || path;
+  const box = document.createElement("label");
+  box.className = "f";
+  const name = document.createElement("div");
+  name.innerHTML = `<span>${label}</span><small class="mono">${path}</small>`;
+  box.appendChild(name);
+
+  if (type === "bool") {
+    const sw = document.createElement("div");
+    sw.className = "switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = !!value;
+    input.addEventListener("change", () => dirty.set(path, input.checked));
+    const knob = document.createElement("i");
+    sw.append(input, knob);
+    box.appendChild(sw);
+    return box;
+  }
+  let input;
+  if (type.startsWith("enum:")) {
+    input = document.createElement("select");
+    for (const opt of type.slice(5).split(",")) {
+      const o = document.createElement("option");
+      o.value = opt; o.textContent = opt;
+      input.appendChild(o);
+    }
+    input.value = value ?? type.slice(5).split(",")[0];
+  } else if (type === "int") {
+    input = document.createElement("input");
+    input.type = "number";
+    input.value = value ?? 0;
+  } else {
+    input = document.createElement("input");
+    input.type = "text";
+    input.value = value ?? "";
+  }
+  input.addEventListener("change", () => {
+    dirty.set(path, type === "int" ? Number(input.value) : input.value);
+  });
+  box.appendChild(input);
+  return box;
+}
+
+function renderControl(state) {
+  for (const [group, paths] of Object.entries(GROUPS)) {
+    const host = document.querySelector(`[data-group="${group}"]`);
+    if (!host) continue;
+    host.innerHTML = "";
+    for (const path of paths) {
+      host.appendChild(fieldEl(path, state.spec[path], state.fields[path]));
+    }
+  }
+}
+
+function renderOverview(s) {
+  document.getElementById("ver").textContent = "v" + (s.version || "?");
+  const login = document.getElementById("p-login");
+  const li = s.browser && s.browser.logged_in;
+  login.textContent = li === true ? "已登录" : li === false ? "掉登录了" : "登录未知";
+  login.className = "pill " + (li === true ? "ok" : li === false ? "bad" : "");
+  const q = document.getElementById("p-quiet");
+  q.hidden = !(s.limits && s.limits.quiet_now);
+
+  const lim = document.getElementById("limits");
+  lim.innerHTML = "";
+  for (const row of (s.limits.rows || [])) {
+    const used = row.used < 0 ? "?" : row.used;
+    const cap = row.cap || 0;
+    const pct = cap ? Math.min(100, Math.round((row.used / cap) * 100)) : 0;
+    const div = document.createElement("div");
+    div.style.marginBottom = "8px";
+    div.innerHTML = `<div class="kv"><span>${row.label}</span><b>${used} / ${cap || "不限"}</b></div>
+      <div class="bar"><i class="${pct >= 90 ? "warn" : ""}" style="width:${pct}%"></i></div>`;
+    lim.appendChild(div);
+  }
+
+  const a = s.auto || {};
+  const last = a.last_round_at ? new Date(a.last_round_at * 1000).toLocaleString() : "还没刷过";
+  document.getElementById("auto").innerHTML = `
+    <div class="kv"><span>今天第几轮</span><b>${a.rounds ?? 0} / ${a.max_rounds || "不限"}</b></div>
+    <div class="kv"><span>今天看了几条</span><b>${a.items ?? 0} / ${a.max_items || "不限"}</b></div>
+    <div class="kv"><span>上次刷完</span><b>${last}</b></div>`;
+
+  const e = s.events || {};
+  const w = e.watcher || {};
+  document.getElementById("events").innerHTML = `
+    <div class="kv"><span>WS 监听</span><b>${e.watcher_alive ? "在线" : "不在"}</b></div>
+    <div class="kv"><span>收到的帧</span><b>${w.frames ?? 0}</b></div>
+    <div class="kv"><span>解出的事件</span><b>${w.events ?? 0}</b></div>
+    <div class="kv"><span>私信守护</span><b>${e.dm_task ? "跑着" : "没跑"}</b></div>`;
+
+  const b = s.browser || {};
+  const win = b.window;
+  document.getElementById("browser").innerHTML = `
+    <div class="kv"><span>登录</span><b>${b.logged_in === true ? "是" : b.logged_in === false ? "否" : "未知"}</b></div>
+    <div class="kv"><span>窗口</span><b>${win ? `${win[0]},${win[1]} · ${win[2]}×${win[3]}` : "没起来"}</b></div>
+    <div class="kv"><span>profile</span><b class="mono" style="font-size:11px">${(b.profile || "").split("\\\\").slice(-1)[0]}</b></div>`;
+
+  const ul = document.getElementById("actions");
+  ul.innerHTML = "";
+  for (const it of (s.actions.items || [])) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="mono">${it.ts || ""}</span>
+      <span class="tag ${it.ok ? "" : "bad"}">${it.kind}</span>
+      ${it.target ? `→ ${it.target}` : ""}
+      <div class="t">${it.detail || ""}</div>`;
+    ul.appendChild(li);
+  }
+  if (!(s.actions.items || []).length) ul.innerHTML = '<li class="muted">还没有动作</li>';
+}
+
+function renderLearn(s) {
+  const host = document.getElementById("cards");
+  host.innerHTML = "";
+  const items = (s.cards && s.cards.items) || [];
+  document.getElementById("card-count").textContent = items.length;
+  for (const c of items) {
+    const li = document.createElement("li");
+    const when = c.at ? new Date(c.at * 1000).toLocaleDateString() : "";
+    li.innerHTML = `<b>${c.topic}</b> <span class="t">${when}</span>
+      <button class="mini danger" data-card="${c.id}">删</button>
+      <div class="t">${c.take || ""}</div>`;
+    host.appendChild(li);
+  }
+  if (!items.length) host.innerHTML = '<li class="muted">还没有卡片，刷一轮看看</li>';
+  host.querySelectorAll("[data-card]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const id = Number(btn.dataset.card);
+      const r = await api("/card/delete", { id });
+      toast(r.message || (r.ok ? "删了" : "失败"), !r.ok);
+      refresh();
+    });
+  });
+  const notes = document.getElementById("notes");
+  if (document.activeElement !== notes) notes.value = s.notes || "";
+}
+
+function renderQueue(s) {
+  const q = s.queue || {};
+  const qc = document.getElementById("qc");
+  qc.innerHTML = "";
+  for (const it of (q.comment_pending || [])) {
+    const li = document.createElement("li");
+    li.innerHTML = `<b>${it.src || "?"}</b><div class="t mono">${it.payload || ""}</div>`;
+    qc.appendChild(li);
+  }
+  if (!(q.comment_pending || []).length) qc.innerHTML = '<li class="muted">没有待回的</li>';
+
+  const qd = document.getElementById("qd");
+  qd.innerHTML = "";
+  for (const it of (q.dm_pending || [])) {
+    const li = document.createElement("li");
+    li.innerHTML = `<b>${it.to}</b><div class="t">${it.text || ""}</div>`;
+    qd.appendChild(li);
+  }
+  if (!(q.dm_pending || []).length) qd.innerHTML = '<li class="muted">没有待发的</li>';
+
+  const inbox = q.inbox || {};
+  document.getElementById("inbox").innerHTML =
+    Object.entries(inbox).map(([k, v]) => `<div class="kv"><span>${k}</span><b>${v}</b></div>`).join("")
+    || '<div class="muted">空</div>';
+}
+
+async function refresh() {
+  try {
+    const s = await api("/state");
+    if (!s || s.ok === false) throw new Error(s && s.message ? s.message : "读取失败");
+    STATE = s;
+    renderOverview(s);
+    renderControl(s);
+    renderLearn(s);
+    renderQueue(s);
+  } catch (e) {
+    toast("读状态失败：" + e.message, true);
+  }
+}
+
+// ---------------- 事件 ----------------
+document.querySelectorAll("nav a").forEach(a => {
+  a.addEventListener("click", () => {
+    document.querySelectorAll("nav a").forEach(x => x.classList.remove("on"));
+    a.classList.add("on");
+    document.querySelectorAll(".sec").forEach(s => s.classList.remove("on"));
+    document.getElementById("sec-" + a.dataset.sec).classList.add("on");
+  });
+});
+
+document.getElementById("btn-refresh").addEventListener("click", refresh);
+
+document.getElementById("btn-theme").addEventListener("click", () => {
+  const cur = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = cur;
+  localStorage.setItem("dy-theme", cur);
+});
+
+document.getElementById("btn-window").addEventListener("click", async () => {
+  const r = await api("/act", { action: "window" });
+  toast(r.message || "", !r.ok);
+});
+
+document.getElementById("btn-save").addEventListener("click", async () => {
+  if (!dirty.size) { toast("没改什么"); return; }
+  const updates = Object.fromEntries(dirty);
+  const r = await api("/save", { updates });
+  if (r.ok) {
+    dirty.clear();
+    toast(`保存了 ${(r.changed || []).length} 项`);
+    refresh();
+  } else {
+    toast("保存失败", true);
+  }
+});
+
+document.getElementById("btn-notes").addEventListener("click", async () => {
+  const text = document.getElementById("notes").value;
+  const r = await api("/notes", { text });
+  toast(r.message || "", !r.ok);
+});
+
+document.getElementById("btn-review").addEventListener("click", async () => {
+  toast("正在写…");
+  const r = await api("/act", { action: "review" });
+  toast(r.message ? r.message.slice(0, 60) : "写完了", !r.ok);
+  refresh();
+});
+
+document.getElementById("btn-confirm").addEventListener("click", async () => {
+  const r = await api("/act", { action: "confirm" });
+  toast(r.message || "", !r.ok);
+  refresh();
+});
+
+document.getElementById("btn-dmflush").addEventListener("click", async () => {
+  const r = await api("/act", { action: "dm_flush" });
+  toast(r.message || "", !r.ok);
+  refresh();
+});
+
+document.getElementById("btn-round").addEventListener("click", async () => {
+  const r = await api("/act", { action: "round" });
+  toast(r.message || "", !r.ok);
+});
+
+document.getElementById("btn-probe").addEventListener("click", async () => {
+  toast("探针跑一次…");
+  const r = await api("/act", { action: "probe" });
+  toast((r.message || "").slice(0, 120), !r.ok);
+});
+
+document.getElementById("btn-dm").addEventListener("click", async () => {
+  const who = document.getElementById("dm-who").value.trim();
+  const text = document.getElementById("dm-text").value.trim();
+  if (!who || !text) { toast("收件人和内容都要填", true); return; }
+  const r = await api("/dm", { who, text });
+  toast(r.message || "", !r.ok);
+});
+
+document.documentElement.dataset.theme = localStorage.getItem("dy-theme") || "dark";
+refresh();
+setInterval(refresh, 8000);
+</script>
+</body>
+</html>
