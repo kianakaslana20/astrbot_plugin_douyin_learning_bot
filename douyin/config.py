@@ -267,7 +267,10 @@ class Settings:
     dm_http: bool = True
     dm_http_limit: int = 20
     notice_http: bool = True        # 发完回读校验，false 只是不校验
-    dm_identity: str = ""
+    dm_identity: str = ""           # 抖音昵称=QQ号，一行一条（抖音侧靠它读 QQ 历史）
+    memory_bridge: bool = True      # QQ 侧注入「抖音私聊 + 最近看的视频」
+    memory_bridge_lines: int = 6    # 注入几句抖音私聊
+    memory_bridge_items: int = 4    # 注入几条看过的视频
     dm_self_names: str = ""    # 自聊会话（自己跟自己）：这些会话里靠"我说过什么"来分辨谁在说,     # 抖音昵称=QQ号，一行一条
     voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
     voice_persona: str = ""        # 人格名；留空 = 用该会话的默认人格
@@ -409,6 +412,9 @@ class Settings:
         dm_quota_separate=_as_bool(ibx.get("dm_quota_separate"), True),
         dm_readback=_as_bool(ibx.get("dm_readback"), True),
         dm_identity=_as_str(ibx.get("dm_identity"), ""),
+        memory_bridge=_as_bool(ibx.get("memory_bridge"), True),
+        memory_bridge_lines=_as_int(ibx.get("memory_bridge_lines"), 0, 30),
+        memory_bridge_items=_as_int(ibx.get("memory_bridge_items"), 0, 20),
         dm_self_names=_as_str(ibx.get("dm_self_names"), ""),
         voice_enabled=_as_bool(ac.get("voice_enabled"), True),
             voice_persona=_as_str(ac.get("voice_persona"), ""),
