@@ -2305,3 +2305,48 @@ WS 帧解出来了，但只解到「谁、说了什么、什么时候」。要�
 
 - 额度是按天清零的粗粒度控制，没有「按小时平滑」。
 - `auto_state.json` 只是单机状态，多实例部署会各算各的。
+
+
+## 40. 从「看过」到「学到」：ASR + 知识点卡片 + 按需注入（v0.17.0）
+
+### 40.1 三条不成立的地方
+
+| 证据 | 现象 |
+|---|---|
+| `aweme.transcript` 161 条全空 | 日志 `ASR[astrbot] APIConnectionError` / `ASR[openai] HTTP 404` → `没有可用的 ASR 通道` |
+| summary 140 条但没有实体 | 只是「这条讲了什么」，没有「我因此改了什么想法」 |
+| 注入只有最近 4 条 × 120 字 | 是「最近」不是「相关」，问了也答不到点上 |
+
+### 40.2 为什么 ASR 走 chat 而不走 transcriptions
+
+| 试过的 | 结果 |
+|---|---|
+| `/compatible-mode/v1/audio/transcriptions` 等四个路径 | 全 404 |
+| `qwen-audio-3.0-asr-flash` / `qwen-audio-3.1-asr-flash-message` | 400 `url error`，只吃公网 URL |
+| `qwen3-asr-flash-realtime` 走 chat | 200 但 content 为 None（要 WS） |
+| DashScope filetrans（`/api/v1/services/audio/asr/transcription`） | 要公网 `file_url`，本地文件走不通 |
+| **`qwen3-asr-flash` 走 chat + `input_audio` data URI** | **可用** |
+
+### 40.3 卡片怎么来
+
+`_digest_knowledge` 每轮一次：`RoundResult.analyzed` 是 `list[tuple[AwemeItem, Analysis]]`，
+取 `item.aweme_id` / `item.desc` / `analysis.summary` / `analysis.keywords`，
+交给 `agent.digest_cards`（`_CARD_RULES`：topic 6~14 字、take 第一人称 20~40 字），
+写进 `knowledge_card`。发送成功与否都不影响卡片落库。
+
+### 40.4 检索怎么用
+
+`_knowledge_lines(query)`：把 query 切成 2/3/4 字片段，对 `keywords|gist|topic` 做 LIKE，
+最多 3 张；命中不到退回 `card_recent` 2 张，避免 prompt 里出现「我没有相关记忆」这种硬答。
+
+### 40.5 每日复盘
+
+`_daily_review`：24h 内 12 张卡片 + 最近两个人各 5 句 → `agent.review_day`
+（`_REVIEW_RULES`：第一人称 3~6 句、说「以前我以为…现在觉得…」）→ 写
+`data_dir/persona_notes.md`，段间 `\n\n---\n\n`，最多 30 段，`_notes_lines` 取最后 2 段注入。
+
+### 40.6 仍缺
+
+- 卡片没有向量检索，全靠 LIKE 切片，同义改写命中率一般。
+- ASR 只对**新下载**的视频生效，历史 171 条不会回填。
+- 复盘是「最近 24 小时」，不是「这周学到什么」的长期沉淀。
