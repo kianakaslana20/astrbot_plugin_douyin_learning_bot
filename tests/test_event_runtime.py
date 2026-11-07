@@ -93,6 +93,7 @@ class Store:
     def __init__(self):
         self.rows = {}
         self.done = []
+        self.replies = {}
     async def inbox_add(self, kind, key, *, src="", payload=""):
         identity = (kind, key)
         if identity in self.rows:
@@ -105,6 +106,10 @@ class Store:
             self.rows[(kind, key)]["pending"] = False
     async def inbox_pending(self, kind, limit=20):
         return [r.copy() for (k, _), r in self.rows.items() if k == kind and r["pending"]][:limit]
+    async def reply_count(self, uid):
+        return self.replies.get(str(uid), 0)
+    async def reply_hit(self, uid, who="", cid="", aweme_id=""):
+        self.replies[str(uid)] = self.replies.get(str(uid), 0) + 1
 
 
 class WatcherTests(unittest.IsolatedAsyncioTestCase):
@@ -228,14 +233,18 @@ METHODS = {"_one_event_round", "_handle_mention", "_mention_work", "_entry_event
            "_attach_watcher", "_on_page_ready", "_attach_event_page",
            "_ws_claimed", "_ws_mark", "_ws_self_echo", "_matches_push",
            "_http_scan", "_http_dm_scan", "_http_notice_scan", "_name_of",
-           "_state_load", "_state_save"}
+           "_state_load", "_state_save",
+           "_insider", "_reply_mode", "_reply_blocked"}
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.Subject = extract(ROOT / "main.py", names=METHODS, Entry=Entry)
         self.app = self.Subject()
-        self.app.settings = types.SimpleNamespace(action_mode="ask", event_ws=True)
+        self.app.settings = types.SimpleNamespace(
+            action_mode="ask", event_ws=True,
+            comment_reply_mode="ask", comment_reply_once_others=True,
+        )
         self.app.browser = types.SimpleNamespace(page=AsyncMock(return_value="PAGE"))
         self.app.inbox = types.SimpleNamespace(collect=AsyncMock(return_value=[]))
         self.app.social = types.SimpleNamespace(_uid_cache={}, reply_comment=AsyncMock())
@@ -396,7 +405,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirm_off_retains_pending(self):
         await self.queue()
-        self.app.settings.action_mode = "off"
+        self.app.settings.comment_reply_mode = "off"
         self.app._send_comment_reply = AsyncMock()
         await self.app._confirm_comment_replies()
         self.app._send_comment_reply.assert_not_awaited()
@@ -418,7 +427,7 @@ class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.app.limits.hit_async.assert_awaited_once_with("comment")
 
     async def test_im_comment_never_routes_to_public_reply(self):
-        self.app.settings.action_mode = "auto"
+        self.app.settings.comment_reply_mode = "auto"
         self.app.social.reply_comment.return_value = types.SimpleNamespace(ok=True)
         await self.app._mention_work("PAGE", entry("comment", channel="im", route="dm", comment_id="c"), "")
         self.app.social.reply_comment.assert_not_awaited()
