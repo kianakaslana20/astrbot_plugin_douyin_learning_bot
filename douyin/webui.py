@@ -238,12 +238,31 @@ def _auto_state(bot) -> dict:
 
 async def _queue_state(bot) -> dict:
     out = {"comment_pending": [], "dm_pending": [], "inbox": {}}
+
+    def _payload(row) -> dict:
+        """队列里的 payload 是 python repr（单引号），别让前端去碰 JSON.parse。"""
+        raw = row.get("payload") or ""
+        parsed: dict = {}
+        try:
+            import ast
+            value = ast.literal_eval(raw) if raw.strip().startswith("{") else None
+            if isinstance(value, dict):
+                parsed = value
+        except Exception:  # noqa: BLE001
+            parsed = {}
+        return {
+            "key": row.get("key", ""),
+            "src": row.get("src", ""),
+            "uid": str(parsed.get("uid") or ""),
+            "who": str(parsed.get("who") or ""),
+            "cid": str(parsed.get("comment_id") or ""),
+            "aweme_id": str(parsed.get("aweme_id") or ""),
+            "text": (str(parsed.get("text") or "") or raw)[:160],
+        }
+
     try:
-        out["comment_pending"] = [
-            {"key": row.get("key", ""), "src": row.get("src", ""),
-             "payload": (row.get("payload") or "")[:160]}
-            for row in await bot.store.inbox_pending("comment_reply", 20)
-        ]
+        out["comment_pending"] = [_payload(row)
+                                 for row in await bot.store.inbox_pending("comment_reply", 20)]
     except Exception as exc:  # noqa: BLE001
         out["comment_error"] = type(exc).__name__
     try:
