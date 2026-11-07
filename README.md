@@ -837,3 +837,16 @@ MIT，见 [LICENSE](LICENSE)。
 自检：`plugin_data/astrbot_plugin_douyin_learning_bot/auto_state.json` 里能看到
 `{"day": "...", "rounds": N, "items": M, "last_round_at": ...}`。要是 `rounds` 一直不涨，
 说明自主刷根本没跑（看日志有没有「自主刷：已启动」）。
+
+
+## 四点一二、听得见、记得住、用得上（v0.17.0）
+
+| 环节 | 以前 | 现在 |
+|---|---|---|
+| 语音 | 三条通道全挂，`transcript` 161 条全空 | `asr_backend=chat`（qwen3-asr-flash 走 chat/completions），真机转出 1239 字 |
+| 记录 | 只有一条摘要，聊不起来 | `knowledge_card` 卡片：主题 + 第一人称结论 |
+| 使用 | 只注入「最近 4 条摘要」 | 按你那句话检索卡片 + 每日复盘写进 `persona_notes.md` 一起注入 |
+
+- 每轮只多花一次模型调用（8 条摘要 → 最多 8 张卡片）。
+- 卡片只留「真有信息量」的：纯搞笑、纯情绪、纯广告不落卡。
+- `persona_notes.md` 在插件数据目录，最多留 30 段，随时可删。
