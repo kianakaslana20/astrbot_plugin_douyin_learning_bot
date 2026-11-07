@@ -226,7 +226,9 @@ class WatcherTests(unittest.IsolatedAsyncioTestCase):
 METHODS = {"_one_event_round", "_handle_mention", "_mention_work", "_entry_event",
            "_send_comment_reply", "_confirm_comment_replies", "_event_loop", "_wait_signal",
            "_attach_watcher", "_on_page_ready", "_attach_event_page",
-           "_ws_claimed", "_ws_mark", "_ws_self_echo", "_matches_push"}
+           "_ws_claimed", "_ws_mark", "_ws_self_echo", "_matches_push",
+           "_http_scan", "_http_dm_scan", "_http_notice_scan", "_name_of",
+           "_state_load", "_state_save"}
 
 
 class MainRuntimeTests(unittest.IsolatedAsyncioTestCase):
