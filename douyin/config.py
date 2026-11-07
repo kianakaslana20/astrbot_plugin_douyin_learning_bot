@@ -271,7 +271,10 @@ class Settings:
     dm_identity: str = ""           # 抖音昵称=QQ号，一行一条（抖音侧靠它读 QQ 历史）
     memory_bridge: bool = True      # QQ 侧注入「抖音私聊 + 最近看的视频」
     memory_bridge_lines: int = 6    # 注入几句抖音私聊
-    memory_bridge_items: int = 4    # 注入几条看过的视频
+    memory_bridge_items: int = 4
+    knowledge_enabled: bool = True        # 把摘要压成知识点卡片，聊天时才有东西可用
+    knowledge_cards_in_prompt: int = 3    # 每次注入几张（按对方这句话相关度捞）
+    knowledge_review_daily: bool = True   # 每天写一段「这几天想明白了什么」进人格档案    # 注入几条看过的视频
     dm_self_names: str = ""    # 自聊会话（自己跟自己）：这些会话里靠"我说过什么"来分辨谁在说,     # 抖音昵称=QQ号，一行一条
     voice_enabled: bool = True     # 关掉就退回 comment_template（老行为）
     voice_persona: str = ""        # 人格名；留空 = 用该会话的默认人格
@@ -418,6 +421,9 @@ class Settings:
         memory_bridge=_as_bool(ibx.get("memory_bridge"), True),
         memory_bridge_lines=_as_int(ibx.get("memory_bridge_lines"), 0, 30),
         memory_bridge_items=_as_int(ibx.get("memory_bridge_items"), 0, 20),
+        knowledge_enabled=_as_bool(ibx.get("knowledge_enabled"), True),
+        knowledge_cards_in_prompt=_as_int(ibx.get("knowledge_cards_in_prompt"), 3, 0, 8),
+        knowledge_review_daily=_as_bool(ibx.get("knowledge_review_daily"), True),
         dm_self_names=_as_str(ibx.get("dm_self_names"), ""),
         voice_enabled=_as_bool(ac.get("voice_enabled"), True),
             voice_persona=_as_str(ac.get("voice_persona"), ""),
