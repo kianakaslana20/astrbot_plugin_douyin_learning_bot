@@ -51,6 +51,7 @@ try:  # 正常情况：被 AstrBot 当作 data.plugins.<name>.main 加载
     from .douyin.store import Store
     from .douyin.understanding import Understander
     from .douyin.voice import Voice
+    from .douyin import webui
 except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录塞进 sys.path
     import sys
 
@@ -77,6 +78,7 @@ except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录
     from douyin.store import Store  # type: ignore
     from douyin.understanding import Understander  # type: ignore
     from douyin.voice import Voice  # type: ignore
+    from douyin import webui  # type: ignore
 
 PLUGIN_NAME = "astrbot_plugin_douyin_learning_bot"
 
@@ -220,6 +222,7 @@ class DouyinLearningBot(Star):
         self._watch_attach_lock = asyncio.Lock()
         self._comment_confirm_lock = asyncio.Lock()
         self.browser.on_page_ready = self._attach_event_page
+        self._register_web_apis()
         self._mention_seen: dict[str, str] = {}
         self._last_round_at = 0.0
         self._auto_rounds_today = 0
@@ -252,6 +255,146 @@ class DouyinLearningBot(Star):
             pass
 
     # ------------------------------------------------------- M0 探针（运维钩子）
+    # ------------------------------------------------------------ 面板（WebUI）
+    def _register_web_apis(self) -> None:
+        register = getattr(self.context, "register_web_api", None)
+        if not callable(register):
+            logger.info("面板：当前 AstrBot 不支持插件 Web API，跳过注册")
+            return
+        routes = [
+            ("/state", self.api_state, ["GET"], "面板：一次拉完状态"),
+            ("/save", self.api_save, ["POST"], "面板：改配置"),
+            ("/act", self.api_act, ["POST"], "面板：立即做一件事"),
+            ("/dm", self.api_dm, ["POST"], "面板：发私信"),
+            ("/card/delete", self.api_card_delete, ["POST"], "面板：删卡片"),
+            ("/notes", self.api_notes_save, ["POST"], "面板：改人格档案"),
+        ]
+        for path, handler, methods, desc in routes:
+            try:
+                register(f"/{PLUGIN_NAME}{path}", self._web_guard(handler), methods, desc)
+            except Exception as exc:  # noqa: BLE001
+                logger.info(f"面板：注册 {path} 失败（{type(exc).__name__}: {exc}）")
+        logger.info("面板：已注册 6 个接口（/dyui）")
+
+    @staticmethod
+    def _web_guard(handler):
+        """把接口里的异常收成一句人话 —— 面板上看到 500 比看到原因还难查。"""
+        async def wrapper(**_kw):
+            try:
+                return await handler(**_kw)
+            except Exception as exc:  # noqa: BLE001
+                logger.info(f"面板接口出错（{type(exc).__name__}）：{exc}")
+                return {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
+        return wrapper
+
+    def _reload_settings(self) -> None:
+        """面板改完配置后重建 Settings，并推给所有吃设置的子模块。"""
+        self.settings = Settings.load(self.config)
+        for name in ("browser", "understander", "pipeline", "social",
+                     "voice", "inbox", "agent"):
+            obj = getattr(self, name, None)
+            if obj is not None and hasattr(obj, "settings"):
+                obj.settings = self.settings
+
+    async def _json_body(self) -> dict:
+        try:
+            from quart import request as _req
+        except Exception:  # noqa: BLE001
+            return {}
+        try:
+            data = await _req.get_json(silent=True)
+        except Exception:  # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def api_state(self, **_kw):
+        return await webui.snapshot(self)
+
+    async def api_save(self, **_kw):
+        body = await self._json_body()
+        updates = body.get("updates") if isinstance(body.get("updates"), dict) else body
+        changed, rejected = webui.apply_updates(self.config, updates or {})
+        saved = False
+        try:
+            saver = getattr(self.config, "save_config_async", None)
+            if callable(saver):
+                await saver()
+                saved = True
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"面板：配置写盘失败（{type(exc).__name__}: {exc}）")
+        if changed:
+            self._reload_settings()
+        logger.info(f"面板：改了 {len(changed)} 项配置（写盘={'是' if saved else '否'}）")
+        return {"ok": True, "changed": changed, "rejected": rejected, "saved": saved,
+                "fields": webui.editable_fields(self.config)}
+
+    async def api_act(self, **_kw):
+        body = await self._json_body()
+        action = str(body.get("action") or "").strip()
+        if action == "round":
+            umo = self._push_target or self._last_umo or ""
+            job = self.jobs.submit("round", umo, int(getattr(self.settings, "want_count", 3) or 3))
+            return {"ok": job is not None, "message": "已经排上一轮，跑完照简报规则推送" if job else "队列忙，稍后再试"}
+        if action == "confirm":
+            lines = await self._confirm_comment_replies()
+            return {"ok": True, "message": "\n".join(lines) or "队列是空的"}
+        if action == "dm_flush":
+            lines = await self._dm_flush(self._push_target or "")
+            return {"ok": True, "message": "\n".join(lines) or "没有待发的私信"}
+        if action == "review":
+            self._review_day = ""
+            text = await self._daily_review(self._push_target or "")
+            return {"ok": bool(text), "message": text[:400] or "没写出东西（可能模型不可用）"}
+        if action == "window":
+            try:
+                await self.browser.show_window()
+                return {"ok": True, "message": "窗口已经提到前台"}
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
+        if action == "probe":
+            out = {}
+            try:
+                out["im"] = await self.imapi.probe()
+            except Exception as exc:  # noqa: BLE001
+                out["im"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            try:
+                out["notice"] = await self.noticeapi.probe()
+            except Exception as exc:  # noqa: BLE001
+                out["notice"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            return {"ok": True, "message": json.dumps(out, ensure_ascii=False)[:900]}
+        return {"ok": False, "message": f"不认识的 action：{action or '（空）'}"}
+
+    async def api_dm(self, **_kw):
+        body = await self._json_body()
+        who = str(body.get("who") or "").strip()
+        text = str(body.get("text") or "").strip()
+        if not who or not text:
+            return {"ok": False, "message": "收件人和内容都得填"}
+        try:
+            ok, message = await self.send_dm(who, text)
+        except Exception as exc:  # noqa: BLE001
+            # 面板点一下正好撞上页面跳转/浏览器刚起，别把 500 甩给人看
+            return {"ok": False, "message": f"没发成（{type(exc).__name__}）：{exc}"}
+        return {"ok": bool(ok), "message": str(message)}
+
+    async def api_card_delete(self, **_kw):
+        body = await self._json_body()
+        try:
+            card_id = int(body.get("id") or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": "id 不对"}
+        done = await self.store.card_delete(card_id)
+        return {"ok": bool(done), "message": "删了" if done else "没找到这张卡片"}
+
+    async def api_notes_save(self, **_kw):
+        body = await self._json_body()
+        text = str(body.get("text") or "")
+        try:
+            self._notes_path().write_text(text, "utf-8")
+            return {"ok": True, "message": f"已保存（{len(text)} 字）"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
+
     async def _probe_hook(self) -> None:
         """`data_dir/probe_request.json` 存在时跑一次只读探针，结果写 `probe_result.json`。
 
