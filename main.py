@@ -40,6 +40,8 @@ try:  # 正常情况：被 AstrBot 当作 data.plugins.<name>.main 加载
     from .douyin.feed import parse_aweme
     from .douyin.agent import DouyinAgent
     from .douyin.im import ImWatcher
+    from .douyin.imapi import ImApi, ImApiError
+    from .douyin.noticeapi import NoticeApi, NoticeApiError
     from .douyin.inbox import Entry, Inbox
     from .douyin.jobs import Job, JobQueue
     from .douyin.limits import Limits
@@ -64,6 +66,8 @@ except ImportError:  # 兜底：被当成顶层模块加载时，把插件目录
     from douyin.feed import parse_aweme  # type: ignore
     from douyin.agent import DouyinAgent
     from douyin.im import ImWatcher
+    from douyin.imapi import ImApi, ImApiError  # type: ignore
+    from douyin.noticeapi import NoticeApi, NoticeApiError  # type: ignore
     from douyin.inbox import Entry, Inbox  # type: ignore
     from douyin.jobs import Job, JobQueue  # type: ignore
     from douyin.limits import Limits  # type: ignore
@@ -116,6 +120,8 @@ HELP_TEXT = """/dy            状态与用法
 /dy update     检查 GitHub 上有没有新版本（apply 直接拉取）
 /dy dm 昵称 话  给这个人发条抖音私信（ask 模式会先攒着）
 /dy confirm     把攒着的私信真发出去
+/dy imapi        试私信 HTTP 通道（只读）：会话数、消息时间戳齐不齐
+/dy noticeapi    试通知 HTTP 通道（只读）：有几条、带不带 comment_id
 /dy stop       关掉浏览器，释放内存"""
 
 SUB_ALIASES = {
@@ -205,6 +211,9 @@ class DouyinLearningBot(Star):
         self.social = Social(self.browser, self.settings, dump_dir)
         self.voice = Voice(self.context, self.settings)
         self.inbox = Inbox(self.browser, self.settings)
+        # 两条只读 HTTP 通道（M0 起）：私信 / 通知。都不碰 DOM，也不发任何东西。
+        self.imapi = ImApi(self.browser)
+        self.noticeapi = NoticeApi(self.browser)
         self.agent = DouyinAgent(self.voice, self.settings, self.store, self.memory)
         self.watcher = None
         self._ws_dm_seen = []      # [(who, text, ts)] —— WS 已经认领的私信，DOM 那条要跳过
@@ -219,6 +228,7 @@ class DouyinLearningBot(Star):
         self._think_task = None
         self._last_user_at = 0.0
         self.inbox.sent_lookup = self.memory.recent_me
+        self._http_state: dict = {}
         self._pending: list[tuple] = []
         self._pending_kinds: set[str] = set()
         self._pending_at: float = 0.0
@@ -235,6 +245,80 @@ class DouyinLearningBot(Star):
         self._no_target_noticed = False
         self._want_loop = bool(self.settings.enabled and self.settings.loop_enabled)
         self._ensure_dm_watch()
+        try:
+            if (self.data_dir / "probe_request.json").exists():
+                self._probe_task = asyncio.create_task(self._probe_hook())
+        except RuntimeError:      # 当前没有运行中的事件循环
+            pass
+
+    # ------------------------------------------------------- M0 探针（运维钩子）
+    async def _probe_hook(self) -> None:
+        """`data_dir/probe_request.json` 存在时跑一次只读探针，结果写 `probe_result.json`。
+
+        为什么要这条钩子：这两条 HTTP 通道只能在**插件进程内**调 —— cookie 活在浏览器
+        上下文里，而浏览器又被本进程占着 profile，外部脚本连不上它的 CDP。命令则要有人
+        发消息才动。留一个本地文件开关，重载插件就把结果算出来，谁放文件谁拿结果。
+        """
+        req = self.data_dir / "probe_request.json"
+        if not req.exists():
+            return
+        started = time.time()
+        targets = ["im", "notice"]
+        try:
+            raw = json.loads(req.read_text(encoding="utf-8-sig") or "{}")
+            if isinstance(raw, dict) and isinstance(raw.get("probe"), list):
+                targets = [str(t) for t in raw["probe"]]
+        except Exception:  # noqa: BLE001
+            pass
+        attempt = 0
+        if isinstance(raw, dict):
+            try:
+                attempt = int(raw.get("attempt") or 0)
+            except (TypeError, ValueError):
+                attempt = 0
+        out: dict = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "targets": targets,
+                     "attempt": attempt}
+        try:
+            page = await self.browser.page()      # 确保浏览器/登录态就绪
+            # 刚起的上下文里 cookie jar 还是空的，必须先把 douyin.com 打开一次，
+            # profile 里的 cookie 才会被带进这个上下文（否则一律报「没 sessionid」）。
+            if "douyin.com" not in (page.url or ""):
+                await page.goto("https://www.douyin.com/", wait_until="domcontentloaded",
+                                timeout=45000)
+                await asyncio.sleep(2.0)
+            out["page_url"] = page.url
+        except Exception as exc:  # noqa: BLE001
+            out["browser"] = f"{type(exc).__name__}: {exc}"
+        if "im" in targets:
+            out["im"] = await self.imapi.probe()
+        if "notice" in targets:
+            out["notice"] = await self.noticeapi.probe()
+        out["ms"] = int((time.time() - started) * 1000)
+        try:
+            (self.data_dir / "probe_result.json").write_text(
+                json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8"
+            )
+            req.unlink()
+            logger.info("探针：结果已写入 probe_result.json（%s ms）", out["ms"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("探针：结果写不进去（%s）", type(exc).__name__)
+        if not out.get("browser"):
+            return
+        # 浏览器还没起来（上一次内核还在退出）：留着请求，下一轮再来，最多五次。
+        if attempt >= 4:
+            try:
+                req.unlink()
+            except OSError:
+                pass
+            logger.warning("探针：浏览器连续 %s 次没起来，放弃", attempt + 1)
+            return
+        try:
+            req.write_text(
+                json.dumps({"probe": targets, "attempt": attempt + 1}), encoding="utf-8"
+            )
+            logger.info("探针：浏览器还没起来，下一轮再试（第 %s 次）", attempt + 1)
+        except OSError:
+            pass
 
     def _detect_platform(self) -> str:
         """猜一个平台 id（就是 umo 的第一段，比如「大肥鱼」）。"""
@@ -1074,6 +1158,9 @@ class DouyinLearningBot(Star):
             try:
                 await self._ensure_ready()
                 page = await self.browser.page()
+                if (self.data_dir / "probe_request.json").exists():
+                    # 运维探针：谁往数据目录放了这个文件，就在这一轮跑一次只读探针。
+                    await self._probe_hook()
                 if self.watcher is None or self.watcher.page is not page:
                     if self.watcher is not None:
                         await self.watcher.close()
@@ -1222,6 +1309,24 @@ class DouyinLearningBot(Star):
             await self.store.inbox_done("ws_evidence", str(evt.get("event_id") or evt.get("raw_frame_id")), "decoded_wait_identity")
             # Exact nickname alone does not establish that this is an incoming message.
             # Unmatched IM events remain evidence until the UI confirms sender direction.
+        # WS 只是「有动静」的信号；正文、时间戳、评论 id 从接口拿。
+        # 界面那条路继续留着兜底（接口万一变了，DOM 还能读到）。
+        try:
+            http_entries = await self._http_scan(
+                first=(source == "baseline"), dm=include_dm, notices=include_mentions
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("HTTP 增量拉取失败（走界面兜底）：%s: %s", type(exc).__name__, exc)
+            try:
+                import traceback
+                with open(self.data_dir / "event_errors.log", "a", encoding="utf-8") as fh:
+                    fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] http_scan:\n"
+                             f"{traceback.format_exc()}\n")
+            except Exception:  # noqa: BLE001
+                pass
+            http_entries = []
+        if http_entries:
+            entries.extend(http_entries)
         fresh = []
         queued_users = set()
         skipped = replied = judged = 0
@@ -1299,6 +1404,163 @@ class DouyinLearningBot(Star):
             for evt in raw:
                 watcher.release(evt)
 
+    # ------------------------------------------------ HTTP 增量（M1 私信 / M2 通知）
+    def _state_load(self, name: str):
+        """读一次 HTTP 游标（进程内缓存，落盘 http_state.json）。"""
+        cache = getattr(self, "_http_state", None)
+        if cache is None:
+            cache = self._http_state = {}
+        if name in cache:
+            return cache[name]
+        data: dict = {}
+        data_dir = getattr(self, "data_dir", None)
+        if data_dir is not None:
+            try:
+                loaded = json.loads((data_dir / "http_state.json").read_text(encoding="utf-8") or "{}")
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}
+        default = {} if name == "im" else []
+        value = data.get(name)
+        cache[name] = value if isinstance(value, type(default)) else default
+        return cache[name]
+
+    def _state_save(self) -> None:
+        data_dir = getattr(self, "data_dir", None)
+        if data_dir is None:
+            return
+        try:
+            (data_dir / "http_state.json").write_text(
+                json.dumps(getattr(self, "_http_state", {}) or {}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("HTTP 游标存不下：%s", exc)
+
+    def _name_of(self, uid: str) -> str:
+        """uid 反查昵称：只认唯一命中，猜不出来就返回空（宁可不回，不回错人）。"""
+        if not uid:
+            return ""
+        names = [name for name, slot in getattr(self.social, "_uid_cache", {}).items()
+                 if isinstance(slot, dict) and str(slot.get("uid") or "") == uid]
+        return names[0] if len(names) == 1 else ""
+
+    async def _http_scan(self, *, first: bool, dm: bool, notices: bool) -> list:
+        out: list = []
+        if dm and getattr(self.settings, "dm_http", True):
+            out.extend(await self._http_dm_scan(first=first))
+        if notices and getattr(self.settings, "notice_http", True):
+            out.extend(await self._http_notice_scan(first=first))
+        return out
+
+    async def _http_dm_scan(self, *, first: bool) -> list:
+        """私信增量。`first` 只推进游标，不回积压。"""
+        api = getattr(self, "imapi", None)
+        if api is None:
+            return []
+        try:
+            convs = await api.conversations(
+                limit=int(getattr(self.settings, "dm_http_limit", 20) or 20)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("私信 HTTP 拉取跳过：%s", exc)
+            return []
+        cursor = self._state_load("im")
+        if not isinstance(cursor, dict):
+            cursor = {}
+            self._http_state["im"] = cursor
+        out: list = []
+        for conv in convs:
+            conv_id = str(conv.get("conv_id") or "")
+            if not conv_id:
+                continue
+            try:
+                mark = int(cursor.get(conv_id) or 0)
+            except (TypeError, ValueError):
+                mark = 0
+            newest = mark
+            for message in conv.get("messages") or []:
+                ts = int(message.get("create_time") or 0)
+                if message.get("mine"):
+                    newest = max(newest, ts)
+                    continue
+                if ts <= mark:
+                    continue
+                newest = max(newest, ts)
+                if first:
+                    continue            # 首轮只对游标，不把旧消息当新私信回一遍
+                uid = str(message.get("from_uid") or "")
+                text = str(message.get("text") or "").strip()
+                who = self._name_of(uid)
+                if not who or not text:
+                    continue
+                kind = "dm_share" if message.get("kind") == "share" else "dm_text"
+                key = "im:%s:%s" % (conv_id, message.get("server_message_id") or ts)
+                out.append(Entry(
+                    kind=kind, key=key, src=who, who=who, text=text, when="",
+                    aweme_id=str(message.get("aweme_id") or ""),
+                    extra={"protocol": True, "source": "http", "from_uid": uid,
+                           "timestamp": ts, "conv_id": conv_id},
+                ))
+                if kind == "dm_text":
+                    self._ws_mark(who, text)   # 让界面那条重复的走 ws_dup，不回两遍
+            if newest:
+                cursor[conv_id] = newest
+        self._state_save()
+        return out
+
+    async def _http_notice_scan(self, *, first: bool) -> list:
+        """通知/评论/@ 增量。带真实 comment_id 的走「按 cid 回复」。"""
+        api = getattr(self, "noticeapi", None)
+        if api is None:
+            return []
+        try:
+            data = await api.items()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("通知 HTTP 拉取跳过：%s", exc)
+            return []
+        # items() 返回的是整包 {counts, items, warnings}，不是列表
+        items = data.get("items") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return []
+        seen = self._state_load("notice")
+        if not isinstance(seen, list):
+            seen = []
+            self._http_state["notice"] = seen
+        known = {str(x) for x in seen}
+        out: list = []
+        for item in items:
+            if not item.get("needs_reply"):
+                continue
+            nid = str(item.get("nid") or "")
+            key = "nt:" + (nid or str(item.get("comment_id") or item.get("create_time") or ""))
+            if key in known:
+                continue
+            known.add(key)
+            seen.append(key)
+            if first:
+                continue
+            aweme_id = str(item.get("aweme_id") or "")
+            if not aweme_id:
+                continue
+            who = str(item.get("from_nick") or "")
+            kind = "comment" if item.get("type") in (31, 32, 35) else "mention"
+            out.append(Entry(
+                kind=kind, key=key, src=who, who=who,
+                text=str(item.get("content") or "").strip(), when="", aweme_id=aweme_id,
+                extra={"protocol": True, "source": "http",
+                       "from_uid": str(item.get("from_uid") or ""),
+                       "comment_id": str(item.get("comment_id") or ""),
+                       "root_comment_id": str(item.get("root_comment_id") or ""),
+                       "timestamp": int(item.get("create_time") or 0),
+                       "notice_type": item.get("type")},
+            ))
+        if len(seen) > 300:
+            del seen[:-300]
+        self._state_save()
+        return out
+
     def _ws_self_echo(self, evt: dict, who: str) -> bool:
         """这条推送是不是我自己发出去、又被服务端推回来的。
 
@@ -1375,7 +1637,7 @@ class DouyinLearningBot(Star):
         )
         if not text:
             return "模型没写出像人话的总结，先不发"
-        await self._notify_text(umo, f"{entry.who} 分享来一条：{item.title}\n\n{text}", umo=umo)
+        await self._notify_text(umo, f"{entry.who} 分享来一条：{item.title}\n\n{text}")
         return "回了：分享总结已发"
 
     # ---------------------------------------------------------------- 自主刷
@@ -1588,7 +1850,7 @@ class DouyinLearningBot(Star):
         if mode in {"ask", "confirm"}:
             await self.store.inbox_add("comment_reply", entry.key, src=entry.who,
                                       payload=json.dumps(payload, ensure_ascii=False))
-            await self._notify_text(umo, f"待确认评论回复 · {entry.who}\n{text0}\n/dy confirm 确认（12 小时有效）", umo=umo)
+            await self._notify_text(umo, f"待确认评论回复 · {entry.who}\n{text0}\n/dy confirm 确认（12 小时有效）")
             return "评论回复已入待确认队列"
         if payload["comment_id"]:
             return await self._send_comment_reply(payload)
@@ -2606,6 +2868,46 @@ class DouyinLearningBot(Star):
                     "加进配置面板的「评论 @ 白名单」即可）"
                 )
             yield event.plain_result(out)
+            return
+
+        if sub in {"imapi", "私信接口"}:
+            yield event.plain_result("问一下 imapi（只读，别急着关窗口）…")
+            data = await self.imapi.probe()
+            if not data.get("ok"):
+                yield event.plain_result("私信 HTTP 通道不通：" + str(data.get("error") or ""))
+                return
+            lines = [
+                f"私信 HTTP：{data.get('conversations')} 个会话（私聊 {data.get('private')}）",
+                f"读到消息 {data.get('messages')} 条，带时间戳 {data.get('messages_with_timestamp')} 条"
+                f"（{'齐' if data.get('timestamps_all_present') else '不齐'}）",
+                f"耗时 {data.get('ms')} ms —— DOM 那条路要十几秒",
+            ]
+            sample = data.get("sample") or {}
+            if sample:
+                who = "我发的" if sample.get("mine") else f"对方 {sample.get('from_uid')}"
+                lines.append(f"最新一条：{sample.get('text') or '(没文字)'} · {who} · {sample.get('create_time')}")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if sub in {"noticeapi", "通知接口"}:
+            yield event.plain_result("问一下通知接口（只读）…")
+            data = await self.noticeapi.probe()
+            if not data.get("ok"):
+                yield event.plain_result("通知 HTTP 通道不通：" + str(data.get("error") or ""))
+                return
+            lines = [
+                f"通知 HTTP：{data.get('items')} 条，@我 {data.get('at_me')} 条，需要回的 {data.get('needs_reply')} 条",
+                f"带 comment_id 的 {data.get('with_comment_id')} 条 —— 有它才能按 cid 精确回复",
+                f"耗时 {data.get('ms')} ms；未读计数 {data.get('counts')}",
+            ]
+            for item in (data.get("sample") or [])[:3]:
+                lines.append(
+                    f"· {item.get('type_name')}｜{item.get('from_nick') or '(无名)'}｜"
+                    f"{(item.get('content') or '')[:40]}｜cid={item.get('comment_id') or '无'}"
+                )
+            if data.get("warnings"):
+                lines.append("（有告警：" + "; ".join(str(w) for w in data["warnings"][:3]) + "）")
+            yield event.plain_result("\n".join(lines))
             return
 
         if sub == "do":
