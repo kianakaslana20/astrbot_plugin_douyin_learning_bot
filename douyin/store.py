@@ -600,6 +600,22 @@ class Store:
             ).fetchone()
         return bool(row and row["ok"])
 
+    def _fail_count_sync(self, aweme_id: str, kind: str, target: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM social_action "
+                "WHERE aweme_id=? AND kind=? AND target=? AND ok=0",
+                (aweme_id, kind, target),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    async def fail_count(self, aweme_id: str, kind: str, target: str) -> int:
+        """这条视频对这个目标失败过几次 —— 失败太多次就别再硬试了。"""
+        try:
+            return await asyncio.to_thread(self._fail_count_sync, aweme_id, kind, target)
+        except Exception:  # noqa: BLE001
+            return 0
+
     async def acted(self, aweme_id: str, kind: str, target: str) -> bool:
         """这条视频对这个目标是不是已经成功操作过（防重复发送）。"""
         try:
