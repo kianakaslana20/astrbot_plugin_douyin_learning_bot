@@ -74,14 +74,14 @@ class DouyinAgent:
     async def _ask(self, rules: str, body: str, umo: str = "") -> dict:
         provider = None
         try:
-            provider = self.voice.provider(umo) if self.voice else None
+            provider = await self.voice.provider(umo) if self.voice else None
         except Exception as exc:  # noqa: BLE001
             logger.info("agent: 拿不到对话模型（%s）", type(exc).__name__)
         if provider is None:
             return {}
         system = rules
         try:
-            persona = self.voice.persona_prompt(umo) if self.voice else ""
+            persona = await self.voice.persona_prompt(umo) if self.voice else ""
         except Exception:  # noqa: BLE001
             persona = ""
         if persona:
@@ -117,8 +117,13 @@ class DouyinAgent:
         return bool(names) and any(a == who or a in who or who in a for a in names)
 
     # ------------------------------------------------------------ 对外
-    async def handle_douyin_event(self, evt: dict, umo: str = "") -> dict:
-        """evt: {type, from_nick, content, time, event_id}"""
+    async def handle_douyin_event(
+        self, evt: dict, umo: str = "", extra_history: list[str] | None = None
+    ) -> dict:
+        """evt: {type, from_nick, content, time, event_id}
+
+        extra_history：别处拿到的「这个人还说过什么」（比如 QQ 历史），拼在最近对话后面。
+        """
         kind = str(evt.get("type") or "dm")
         who = str(evt.get("from_nick") or "")
         content = str(evt.get("content") or "")
@@ -131,6 +136,7 @@ class DouyinAgent:
                 f"本次内容：{content[:500] or '（空）'}",
                 "最近的对话（旧→新）：",
                 self._history(who) or "（没有记录）",
+                *(extra_history or []),
             ]
         )
         data = await self._ask(_EVENT_RULES, body, umo)
