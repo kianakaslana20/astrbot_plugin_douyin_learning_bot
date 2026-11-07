@@ -426,6 +426,26 @@ class Store:
     async def card_count(self) -> int:
         return await asyncio.to_thread(self._card_count_sync)
 
+    def _card_delete_sync(self, card_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM knowledge_card WHERE id=?", (int(card_id),))
+            return cur.rowcount > 0
+
+    async def card_delete(self, card_id: int) -> bool:
+        return await asyncio.to_thread(self._card_delete_sync, card_id)
+
+    def _actions_recent_sync(self, limit: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT id, ts, aweme_id, kind, target, ok, detail
+                   FROM social_action ORDER BY id DESC LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def actions_recent(self, limit: int = 20) -> list[dict]:
+        return await asyncio.to_thread(self._actions_recent_sync, limit)
+
     async def dm_stats(self) -> dict:
         return await asyncio.to_thread(self._dm_stats_sync)
 
