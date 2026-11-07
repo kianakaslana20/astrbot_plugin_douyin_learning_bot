@@ -224,6 +224,8 @@ class Settings:
     # 写操作
     auto_like: bool = False
     auto_comment: bool = True
+    comment_reply_mode: str = "auto"   # auto / ask / off
+    comment_reply_once_others: bool = True   # 非自己人只回一次
 
     # 写操作（分享 / 评论 @）：off=只播报，ask=推送后问一句，auto=自动执行
     action_mode: str = "off"
@@ -367,6 +369,12 @@ class Settings:
             ffmpeg_path=_as_str(md.get("ffmpeg_path"), ""),
             auto_like=_as_bool(ac.get("auto_like"), False),
             auto_comment=_as_bool(ac.get("auto_comment"), False),
+            comment_reply_mode=(
+                _as_str(ac.get("comment_reply_mode"), "auto").lower()
+                if _as_str(ac.get("comment_reply_mode"), "auto").lower() in {"auto", "ask", "off"}
+                else "auto"
+            ),
+            comment_reply_once_others=_as_bool(ac.get("comment_reply_once_others"), True),
             action_mode=_as_str(ac.get("action_mode"), "off").lower(),
             share_mode=_as_str(ac.get("share_mode"), "panel").lower(),
             share_targets=_as_list(ac.get("share_targets")),
