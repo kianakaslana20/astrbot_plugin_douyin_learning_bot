@@ -8,7 +8,8 @@ from test_event_runtime import Entry, METHODS, extract  # noqa: F401
 
 ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
 
-BRIDGE_METHODS = METHODS | {"_bridge_people", "_bridge_prompt_text", "_qq_of", "_identity_map"}
+BRIDGE_METHODS = METHODS | {"_bridge_people", "_bridge_prompt_text", "_qq_of",
+                  "_identity_map", "_knowledge_lines", "_notes_lines"}
 
 
 class FakeMemory:
@@ -29,6 +30,12 @@ class FakeStore:
 
     async def recent(self, limit=5, only_done=True):
         return self.rows[:limit]
+    async def card_search(self, words, limit=3):
+        return []
+
+    async def card_recent(self, limit=10, since=0.0):
+        return []
+
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
