@@ -94,6 +94,9 @@
     <button id="btn-theme" class="mini">切换主题</button>
   </header>
 
+  <div id="banner" hidden
+    style="margin:0 0 12px;padding:9px 14px;border-radius:11px;border:1px solid var(--err);color:var(--err);background:var(--panel);font-size:13px"></div>
+
   <nav>
     <a data-sec="overview" class="on">概览</a>
     <a data-sec="control">控制</a>
@@ -170,12 +173,39 @@
 <div id="toast"></div>
 
 <script>
-// 主题要在第一帧之前定下来，否则会先白一下
-document.documentElement.setAttribute("data-dy-theme",
-  localStorage.getItem("dy-theme") || "dark");
+// 面板把插件页放在 sandbox="allow-scripts ..." 的 iframe 里（没有 allow-same-origin），
+// 所以 localStorage 一碰就抛 SecurityError —— 全部包起来，别让第一行就把整页打死。
+const store = {
+  get(key, fallback) {
+    try { return localStorage.getItem(key) ?? fallback; } catch (e) { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) { /* 沙箱里没有存储，算了 */ }
+  },
+};
+
 const PLUGIN = "astrbot_plugin_douyin_learning_bot";
-const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
-const BASE = "/api/plug/" + PLUGIN;
+// bridge 由面板在页面里注入，注入顺序不保证 —— 用到时再取，别在开头就缓存成 null
+function getBridge() {
+  return window.AstrBotPluginView || window.AstrBotPluginPage || null;
+}
+const IN_IFRAME = (() => { try { return window.top !== window; } catch (e) { return true; } })();
+// 面板里必须走 bridge（它把请求转成 /api/v1/plugins/extensions/<插件>/<endpoint>）；
+// 直接 fetch 在 opaque origin 里会被拦。
+const EXT = "/api/v1/plugins/extensions/" + PLUGIN;
+
+document.documentElement.setAttribute("data-dy-theme", store.get("dy-theme", "dark"));
+(function watchTheme(attempt) {
+  const b = getBridge();
+  if (b && b.onContext) {
+    b.onContext((ctx) => {
+      if (!ctx || ctx.isDark === undefined) return;
+      document.documentElement.setAttribute("data-dy-theme", ctx.isDark ? "dark" : "light");
+    });
+    return;
+  }
+  if (attempt < 40) setTimeout(() => watchTheme(attempt + 1), 100);
+})(0);
 
 function toast(msg, bad) {
   const el = document.getElementById("toast");
@@ -186,19 +216,45 @@ function toast(msg, bad) {
   toast._t = setTimeout(() => el.classList.remove("on"), 2600);
 }
 
-async function api(path, body) {
-  const endpoint = BASE + path;
-  if (bridge && bridge.apiGet) {
-    try {
-      return body === undefined ? await bridge.apiGet(endpoint) : await bridge.apiPost(endpoint, body);
-    } catch (e) { /* 退回直连 */ }
+let bridgeReady = null;
+
+function bridgeAvailable() {
+  // 最多等 4 秒，等面板把 bridge 注进来
+  return new Promise((resolve) => {
+    const started = Date.now();
+    (function poll() {
+      const b = getBridge();
+      if (b) return resolve(b);
+      if (Date.now() - started > 4000) return resolve(null);
+      setTimeout(poll, 100);
+    })();
+  });
+}
+
+function waitBridge(b) {
+  if (!b) return Promise.resolve(null);
+  if (!bridgeReady) {
+    try { bridgeReady = b.ready ? b.ready() : Promise.resolve(b.getContext && b.getContext()); }
+    catch (e) { bridgeReady = Promise.resolve(null); }
   }
-  const r = await fetch(endpoint, body === undefined
+  return Promise.race([bridgeReady, new Promise((r) => setTimeout(() => r(null), 4000))]);
+}
+
+async function api(path, body) {
+  const rel = String(path).replace(/^\/+/, "");
+  const b = await bridgeAvailable();
+  if (b && b.apiGet) {
+    await waitBridge(b);
+    // bridge 只吃相对 endpoint（"state" / "save"），插件前缀由面板自己补
+    return body === undefined ? await b.apiGet(rel) : await b.apiPost(rel, body);
+  }
+  const r = await fetch(EXT + "/" + rel, body === undefined
     ? { credentials: "include" }
     : { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body) });
-  if (!r.ok) throw new Error("HTTP " + r.status);
-  return r.json();
+  const text = await r.text();
+  if (!r.ok) throw new Error("HTTP " + r.status + " " + text.slice(0, 120));
+  try { return JSON.parse(text); } catch (e) { return { ok: false, message: text.slice(0, 200) }; }
 }
 
 // ---------------- 分组与渲染 ----------------
@@ -360,7 +416,7 @@ function renderLearn(s) {
   host.querySelectorAll("[data-card]").forEach(btn => {
     btn.addEventListener("click", async () => {
       const id = Number(btn.dataset.card);
-      const r = await api("/card/delete", { id });
+      const r = await api("card/delete", { id });
       toast(r.message || (r.ok ? "删了" : "失败"), !r.ok);
       refresh();
     });
@@ -401,18 +457,36 @@ function renderQueue(s) {
     }).join("") || '<div class="muted">空</div>';
 }
 
+let failCount = 0;
 async function refresh() {
   try {
-    const s = await api("/state");
-    if (!s || s.ok === false) throw new Error(s && s.message ? s.message : "读取失败");
+    const s = await api("state");
+    if (!s || (s.ok === false && !s.fields)) throw new Error((s && s.message) || "读取失败");
     STATE = s;
+    failCount = 0;
+    hideBanner();
     renderOverview(s);
     renderControl(s);
     renderLearn(s);
     renderQueue(s);
   } catch (e) {
-    toast("读状态失败：" + e.message, true);
+    failCount += 1;
+    showBanner("读不到插件状态：" + (e && e.message ? e.message : e) +
+      (IN_IFRAME ? "（面板 iframe 里要走 bridge，检查插件是否已启用）" : ""));
+    if (failCount < 2) toast("读状态失败：" + (e && e.message ? e.message : e), true);
   }
+}
+
+function showBanner(text) {
+  const el = document.getElementById("banner");
+  if (!el) return;
+  el.textContent = text;
+  el.hidden = false;
+}
+
+function hideBanner() {
+  const el = document.getElementById("banner");
+  if (el) el.hidden = true;
 }
 
 // ---------------- 事件 ----------------
@@ -431,18 +505,18 @@ document.getElementById("btn-theme").addEventListener("click", () => {
   const cur = document.documentElement.getAttribute("data-dy-theme") === "light"
     ? "dark" : "light";
   document.documentElement.setAttribute("data-dy-theme", cur);
-  localStorage.setItem("dy-theme", cur);
+  store.set("dy-theme", cur);
 });
 
 document.getElementById("btn-window").addEventListener("click", async () => {
-  const r = await api("/act", { action: "window" });
+  const r = await api("act", { action: "window" });
   toast(r.message || "", !r.ok);
 });
 
 document.getElementById("btn-save").addEventListener("click", async () => {
   if (!dirty.size) { toast("没改什么"); return; }
   const updates = Object.fromEntries(dirty);
-  const r = await api("/save", { updates });
+  const r = await api("save", { updates });
   if (r.ok) {
     dirty.clear();
     toast(`保存了 ${(r.changed || []).length} 项`);
@@ -454,37 +528,37 @@ document.getElementById("btn-save").addEventListener("click", async () => {
 
 document.getElementById("btn-notes").addEventListener("click", async () => {
   const text = document.getElementById("notes").value;
-  const r = await api("/notes", { text });
+  const r = await api("notes", { text });
   toast(r.message || "", !r.ok);
 });
 
 document.getElementById("btn-review").addEventListener("click", async () => {
   toast("正在写…");
-  const r = await api("/act", { action: "review" });
+  const r = await api("act", { action: "review" });
   toast(r.message ? r.message.slice(0, 60) : "写完了", !r.ok);
   refresh();
 });
 
 document.getElementById("btn-confirm").addEventListener("click", async () => {
-  const r = await api("/act", { action: "confirm" });
+  const r = await api("act", { action: "confirm" });
   toast(r.message || "", !r.ok);
   refresh();
 });
 
 document.getElementById("btn-dmflush").addEventListener("click", async () => {
-  const r = await api("/act", { action: "dm_flush" });
+  const r = await api("act", { action: "dm_flush" });
   toast(r.message || "", !r.ok);
   refresh();
 });
 
 document.getElementById("btn-round").addEventListener("click", async () => {
-  const r = await api("/act", { action: "round" });
+  const r = await api("act", { action: "round" });
   toast(r.message || "", !r.ok);
 });
 
 document.getElementById("btn-probe").addEventListener("click", async () => {
   toast("探针跑一次…");
-  const r = await api("/act", { action: "probe" });
+  const r = await api("act", { action: "probe" });
   toast((r.message || "").slice(0, 120), !r.ok);
 });
 
@@ -492,11 +566,10 @@ document.getElementById("btn-dm").addEventListener("click", async () => {
   const who = document.getElementById("dm-who").value.trim();
   const text = document.getElementById("dm-text").value.trim();
   if (!who || !text) { toast("收件人和内容都要填", true); return; }
-  const r = await api("/dm", { who, text });
+  const r = await api("dm", { who, text });
   toast(r.message || "", !r.ok);
 });
 
-document.documentElement.dataset.theme = localStorage.getItem("dy-theme") || "dark";
 refresh();
 setInterval(refresh, 8000);
 </script>
