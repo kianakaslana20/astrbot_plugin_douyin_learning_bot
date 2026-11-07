@@ -2723,7 +2723,18 @@ class DouyinLearningBot(Star):
                 if do_share
                 else ([], [])
             )
-            todo = [t for t in wanted if not await self.store.acted(item.aweme_id, "share", t)]
+            todo = []
+            for t in wanted:
+                if await self.store.acted(item.aweme_id, "share", t):
+                    continue
+                fails = 0
+                counter = getattr(self.store, "fail_count", None)
+                if callable(counter):
+                    fails = int(await counter(item.aweme_id, "share", t) or 0)
+                if fails >= 2:
+                    lines.append(f"　跳过分享给「{t}」：已经失败 {fails} 次，不再硬试")
+                    continue
+                todo.append(t)
             why_share = await self.limits.check_async("share", self.settings) if todo else ""
             if todo and why_share:
                 lines.append(f"　跳过分享：{why_share}")
