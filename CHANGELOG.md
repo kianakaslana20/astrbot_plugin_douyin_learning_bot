@@ -1,3 +1,20 @@
+## 0.18.2 —— 面板里点进去白屏，修好了
+
+AstrBot 把插件页塞进 `sandbox="allow-scripts allow-forms allow-downloads"` 的 iframe，
+**没有 `allow-same-origin`** —— 于是 `localStorage` 一碰就抛 `SecurityError`，
+第一行就把整段脚本打死，页面一片空白。三处一起改：
+
+1. 所有 `localStorage` 走 `store.get/set` 包 try/catch，沙箱里静默降级。
+2. 接口改成走 bridge：`bridge.apiGet("state")` / `apiPost("save", …)` —— 面板会把它拼成
+   `/api/v1/plugins/extensions/<插件>/<endpoint>`。之前传的是 `/api/plug/<插件>/state` 全路径，
+   被拼成两层前缀直接 404；而直连 fetch 在 opaque origin 里会被 CORS 拦掉。
+3. bridge 是面板**后注入**的，不能在脚本开头就缓存成 null：改成用到时再取，最多等 4 秒。
+
+另外补了一条顶部错误横幅：万一状态读不到，页面上直接写原因，不再是一片空白。
+
+复现与验证：本地起了个同源 harness，用同样的 `sandbox` 属性 + 相同 postMessage 协议把页面套进去
+（还代理了 extensions 接口），实测五页全部渲染、页签可点、额度/卡片/队列都是真实数据。
+
 ## 0.18.1 —— 面板先能看清，分享别再死磕
 
 - 控制台默认深色：主题属性改成 `data-dy-theme`，不再被面板 bridge 覆盖成浅色。
