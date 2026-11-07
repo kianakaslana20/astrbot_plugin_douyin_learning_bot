@@ -2116,3 +2116,71 @@ if not await self._dm_logged_in():
 
 - 评论文案仍来自 `comment_template`（默认 `{summary}`），没有针对视频内容单独起一段话。
 - 分享要不要也默认自动，是产品决定，现在留给 `action_mode=auto`。
+
+
+## 36. 读的那一层换成接口（v0.13.0）
+
+### 36.1 0.12 停在哪
+
+WS 帧解出来了，但只解到「谁、说了什么、什么时候」。要回一条，还得知道
+「这是哪个会话」「这条评论的 cid 是多少」—— 这两个都不在推送帧里，只能回头读界面。
+界面读不到（面板没渲染、消息折叠、刚导航完 evaluate 被销毁）就只剩一条
+`ws_evidence` 记录，看着像收到了，其实什么也没做。
+
+### 36.2 两条只读接口
+
+| 用途 | 请求 | 拿到的字段 |
+|---|---|---|
+| 私信 | `POST https://imapi.douyin.com/v1/message/get_message_by_init`，body = protobuf 信封 `cmd=2043` | `conv_id`、`sender uid`、`content`、`create_time`(ms)、`server_message_id` |
+| 通知 | `GET https://www.douyin.com/aweme/v1/web/notice/?...&group=G&notice_group=G` | `nid`、`type`、`comment_id`、`aweme_id`、`from_uid`、`content` |
+
+信封字段：`1=cmd, 2=seq, 3="0.1.8", 7="0d50935:feat/pc-im-group", 8=body,
+15=headers(kv), 21="douyin_web", 22="web_sdk"`；响应 `env[4]` 必须是 `"OK"`
+（不是就如实抛，比如 `too many requests`），`env[6] → wrap[2043] → sub[1]` 是会话列表。
+
+通知列表的键是 **`notice_list_v2`**，`group` 与 `notice_group` 要成对给，
+少一个就 `status_code=5`。
+
+### 36.3 游标与幂等
+
+`plugin_data/http_state.json`：
+
+```json
+{"im": {"0:1:263...:433...": 1793825878695},
+ "notice": ["nt:7704428246318367782", "..."]}
+```
+
+`im` 记每个会话已见过的最大 `create_time`，`notice` 记已处理的 `nid`
+（保留最近 300 个）。首轮 baseline 只建游标，把历史整段划过去 ——
+否则升级那一刻会把旧消息当成新私信挨个回。
+
+私信条目 `key = im:{conv_id}:{server_message_id}`，通知条目 `key = nt:{nid}`，
+和 `store.inbox_add` 的幂等一起兜住「同一件事回两遍」。
+
+### 36.4 两条路并存，界面是兜底
+
+`_http_scan()` 抛异常只降级不致命：日志 `HTTP 增量拉取失败（走界面兜底）`，
+栈写 `event_errors.log`，这一轮继续用 DOM 读。反过来，HTTP 拿到的那条会
+`_ws_mark(who, text)` 登记，界面里同一条随后被判成 `ws_dup` 跳过。
+
+### 36.5 顺手修掉的两个老 bug
+
+- `_handle_dm_share_event`：`_notify_text(umo, text, umo=umo)` → `TypeError:
+  got multiple values for argument 'umo'`。从 11-05 起分享总结就一直发不出去，
+  日志里只有一行 `TypeError`。
+- `NoticeApi.items()` 返回 `{counts, items, warnings}`，调用方却直接 `for item in items`
+  → `'str' object has no attribute 'get'`。测试里的桩当时返回的是列表，比生产宽松，
+  所以没拦住；现在桩也返回整包。
+
+### 36.6 验证
+
+- 单测 110 项（`tests/test_http_incremental.py` 12 项：游标、幂等、首轮吞积压、
+  未知发送者跳过、share 保留、接口失败回落、通知 cid/去重/缺 aweme）。
+- 真机 baseline 后 `http_state.json` 同时写出 `im` 两个会话游标与 5 个通知 nid，
+  日志无「HTTP 增量拉取失败」。
+
+### 36.7 仍缺
+
+- 私信发送仍走界面（写接口要 `getBdTicketGuardHeader`，外部补不齐）。
+- 群聊私信不当私聊处理（`conversation_type != 1` 一律跳过）。
+- `@` 提及仍只能靠 UI 点选（API 直发会被服务端剥掉 sec_uid）。
