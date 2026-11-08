@@ -2405,3 +2405,40 @@ browser / understander / pipeline / social / voice / inbox / agent —— 所以
 
 调试用 harness：`E:\工作区\_ui_harness_proxy.py`（静态 + 反代 extensions 接口）配
 `E:\工作区\_ui_harness\index.html`（复刻父页协议），`_shot_iframe.py` / `_click_iframe.py` 出图核对。
+
+
+## 43. 未登录误判 → 619 个 msedge 进程（v0.18.3）
+
+### 43.1 现场
+
+`Get-CimInstance Win32_Process -Filter "Name='msedge.exe'"` 里，命令行带我们 profile 的
+有 **619 个**，但主进程只有 **1 个**。所以不是「重启了 600 次浏览器」，
+而是一份浏览器里的渲染进程/标签页疯狂堆积 —— 每次失败的 launch 都留下了没有被回收的子进程。
+
+日志侧对应：`内核起不来` 2493 次、`TargetClosed` 2490 次，窗口内每 16 秒一条。
+
+### 43.2 四个环
+
+1. **不清理**：`launch_persistent_context` 抛 `TargetClosedError` 时，那个还没完全退出的 Edge
+   仍握着 `profile_dir` 的锁，下一次 launch 100% 再失败 → 自循环。
+2. **不退避**：`_event_loop` 的 `except` 硬编码 `sleep(15)`，于是自循环频率固定在 16 秒。
+3. **三态塌成两态**：`logged_in(launch=False)` 在 `_ctx is None` 与 `page.evaluate` 抛错时都返回
+   `False`，上层据此判定「掉登录」并走扫码流程。
+4. **页面不回收**：`_page()` 取 `pages[0]` 就返回，其余标签页一直留着。
+
+### 43.3 修法
+
+- `_kill_profile_edge(profile_dir)`：PowerShell 查 `msedge.exe` 的 `CommandLine`，
+  只杀含该 profile 目录的进程（**用户自己的 Edge 不受影响**）。launch 前跑一次，三个失败分支各跑一次。
+- `_launch_backoff()` / `_note_launch_fail()` / `_note_launch_ok()`：
+  `min(600, 15 * 2 ** min(fails-1, 5))`，退避期内抛 `DouyinBlocked("浏览器刚启动失败过，N 秒内不再尝试")`。
+- `_event_loop` 用同一套指数退避，成功一轮清零。
+- `logged_in()` 增加 `_login_unknown`：`page.evaluate` 异常时返回上一次的判定（`_last_login_ok`），
+  `_dm_logged_in()` 把它翻成 `None`；`_event_loop` 对 `None` 只记日志 + `sleep(60)`。
+- `_page()` 关掉多余标签页。
+
+### 43.4 验证
+
+清理 619 个残留 → 部署 → 重启 → 观察 2.5 分钟：日志零 `内核起不来` / 零 `TargetClosed` /
+零 `没登录`；`msedge` 11 个进程（1 主 10 子）；`事件守护：接上 私信通道(frontier-im)`、
+`接上 平台互动(frontier-pc)`、`事件守护(baseline)：解码 0 条，读到 6 条` 正常。
