@@ -1608,7 +1608,13 @@ class DouyinLearningBot(Star):
                     logger.info("事件守护：已挂 WS 监听（导航前）")
                 if "douyin.com" not in (page.url or ""):
                     await page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=45000)
-                if not await self._dm_logged_in():
+                logged = await self._dm_logged_in()
+                if logged is None:
+                    # 核对不了（浏览器没起来 / 页面炸了）：别叫人扫码，那只会把浏览器开成一堆。
+                    logger.info("事件守护：登录态核对不了，这一轮先不动，等浏览器恢复")
+                    await asyncio.sleep(60)
+                    continue
+                if logged is False:
                     # 没登录时点「消息」只会弹出「登录后即可查看私信消息」，
                     # 以前这里会默默试四轮再放弃，看着像插件坏了 —— 直接叫人扫码。
                     await self._dm_login_notice()
@@ -1629,26 +1635,39 @@ class DouyinLearningBot(Star):
                 if source == "poll":
                     last_poll = time.monotonic()
                 await self._one_event_round(source)
+                self._ev_fails = 0
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                logger.warning("事件守护异常：%s", exc)
-                await asyncio.sleep(15)
+                self._ev_fails = int(getattr(self, "_ev_fails", 0)) + 1
+                delay = min(600, 15 * (2 ** min(self._ev_fails - 1, 5)))
+                logger.warning(f"事件守护异常（连续第 {self._ev_fails} 次，{delay} 秒后重试）：{exc}")
+                await asyncio.sleep(delay)
 
-    async def _dm_logged_in(self) -> bool:
-        """私信/事件守护用的轻量登录检查：只看当前会话，不主动开浏览器。"""
+    async def _dm_logged_in(self) -> bool | None:
+        """登录态：True 已登录 / False 真掉线 / None 核对不了（别据此叫人扫码）。"""
+        if getattr(self.browser, "_ctx", None) is None:
+            return None          # 浏览器压根没起来，谈不上掉登录
         try:
-            return bool(await self.browser.logged_in(launch=False))
+            if bool(await self.browser.logged_in(launch=False)):
+                return True
+            return False if not getattr(self.browser, "_login_unknown", False) else None
         except Exception as exc:  # noqa: BLE001
-            logger.info("私信守护：登录态没查出来（%s），先当已登录继续", type(exc).__name__)
-            return True
+            logger.info(f"私信守护：登录态没查出来（{type(exc).__name__}），先按未知处理")
+            return None
 
     async def _dm_login_notice(self) -> None:
         """掉登录时叫一次人：把窗口搬上来 + 发二维码，10 分钟内只叫一次。"""
         if not getattr(self.settings, "notify_login", True):
             return
         now = time.time()
-        if now - self._login_notice_at < 600:
+        if now - self._login_notice_at < 1800:      # 半小时只叫一次，别刷屏
+            return
+        if getattr(self.browser, "_ctx", None) is None and now - getattr(
+            self, "_login_notice_at", 0.0
+        ) < 7200:
+            # 浏览器都起不来，发二维码也没意义；真起来了下一轮自然会叫。
+            logger.info("私信守护：浏览器没起来，这次不叫人扫码")
             return
         self._login_notice_at = now
         logger.warning("私信守护：抖音没登录，私信读不到，正在叫人扫码")
