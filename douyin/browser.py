@@ -44,6 +44,51 @@ Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 """
 
 
+# ---------------------------------------------------------------- 进程卫生
+def _kill_profile_edge(profile_dir: Path) -> int:
+    """杀掉命令行里带着这个 profile 目录的 msedge / chrome 进程。
+
+    只认 `--user-data-dir` 落在我们这份 profile 上的进程，**绝不误伤**用户自己开的浏览器。
+    launch 失败时 Edge 未必退出，profile 的锁还捏在它手里 —— 不清掉，下一次必然再失败。
+    """
+    import json as _json
+    import subprocess
+
+    target = str(profile_dir).lower()
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" "
+        "| Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, timeout=25,
+        ).stdout.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return 0
+    try:
+        rows = _json.loads(out) if out.strip() else []
+    except Exception:  # noqa: BLE001
+        return 0
+    if isinstance(rows, dict):
+        rows = [rows]
+    killed = 0
+    for row in rows:
+        cmd = str((row or {}).get("CommandLine") or "").lower()
+        if target not in cmd:
+            continue
+        pid = (row or {}).get("ProcessId")
+        if not pid:
+            continue
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, timeout=15)
+            killed += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return killed
+
+
 class DouyinBlocked(RuntimeError):
     """被抖音风控拦下（验证码页 / 空响应）。"""
 
@@ -95,15 +140,49 @@ class DouyinBrowser:
         self._session_expired = False     # sid_guard 说会话已过期（cookie 还在，写操作会回 8）
         self.channel_lock = profile_dir / "channel.lock"   # 这份 profile 是哪个内核写的
 
+
     # ------------------------------------------------------------------ 生命周期
+
+    def _launch_backoff(self) -> float:
+        """连续失败几次之后，还要等多久才允许再试。"""
+        wait = float(getattr(self, "_launch_block_until", 0.0)) - time.time()
+        return max(0.0, wait)
+
+    def _note_launch_fail(self, exc: Exception) -> None:
+        """失败一次就把重试间隔翻倍，封顶 10 分钟 —— 绝不每 16 秒撞一次。"""
+        self._launch_fails = int(getattr(self, "_launch_fails", 0)) + 1
+        delay = min(600, 15 * (2 ** min(self._launch_fails - 1, 5)))
+        self._launch_block_until = time.time() + delay
+        logger.warning(
+            f"浏览器启动第 {self._launch_fails} 次失败（{type(exc).__name__}），{delay} 秒内不再重试"
+        )
+
+    def _note_launch_ok(self) -> None:
+        if getattr(self, "_launch_fails", 0):
+            logger.info(f"浏览器起来了（前面失败过 {self._launch_fails} 次）")
+        self._launch_fails = 0
+        self._launch_block_until = 0.0
 
     async def _ensure(self):
         if self._ctx is not None:
             return self._ctx
         from playwright.async_api import async_playwright
 
+        wait = self._launch_backoff()
+        if wait > 0:
+            raise DouyinBlocked(
+                f"浏览器刚启动失败过，{int(wait)} 秒内不再尝试（避免连环拉起一堆进程）"
+            )
+
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._guard_kernel()
+
+        # 上一轮失败的 Edge 可能还捏着 profile 的锁：先清掉，再起新的。
+        killed = await asyncio.to_thread(_kill_profile_edge, self.profile_dir)
+        if killed:
+            logger.warning(f"清掉 {killed} 个还占着 profile 的残留浏览器进程")
+            await asyncio.sleep(1.0)
+
         self._pw = await async_playwright().start()
         launch_kwargs: dict = {
             "headless": bool(self.settings.headless),
@@ -163,6 +242,8 @@ class DouyinBrowser:
                 # 严格模式：内核必须跟桌面一致，不偷偷换 —— 换内核等于换指纹，
                 # 抖音那边看到的浏览器变了，登录态和风控状态都不是一回事。
                 await self._shutdown_playwright()
+                await asyncio.to_thread(_kill_profile_edge, self.profile_dir)
+                self._note_launch_fail(exc)
                 raise DouyinBlocked(
                     f"{self.settings.channel} 内核起不来（{type(exc).__name__}: {exc}）。"
                     f"channel_strict 开着，不退回 chromium。"
@@ -187,12 +268,17 @@ class DouyinBrowser:
                                      launch_kwargs, profile=fb_dir)
                 except Exception as exc2:  # noqa: BLE001
                     await self._shutdown_playwright()
+                    await asyncio.to_thread(_kill_profile_edge, self.profile_dir)
+                    self._note_launch_fail(exc2)
                     raise DouyinBlocked(
                         f"浏览器启动失败：{type(exc2).__name__}: {exc2}"
                     ) from exc2
             else:
                 await self._shutdown_playwright()
+                await asyncio.to_thread(_kill_profile_edge, self.profile_dir)
+                self._note_launch_fail(exc)
                 raise DouyinBlocked(f"浏览器启动失败：{type(exc).__name__}: {exc}") from exc
+        self._note_launch_ok()
         self._ctx.set_default_timeout(45_000)
         try:
             await self._ctx.add_init_script(_STEALTH_JS)
@@ -331,6 +417,16 @@ class DouyinBrowser:
     async def _page(self):
         ctx = await self._ensure()
         pages = [p for p in ctx.pages if not p.is_closed()]
+        if len(pages) > 1:
+            # 只留第一个页面。登录弹层/异常路径开出来的多余标签页会把进程数堆上去
+            # （真机上见过 600+ 个 msedge 进程，就是这里没收敛）。
+            for extra in pages[1:]:
+                try:
+                    await extra.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            logger.info(f"关掉了 {len(pages) - 1} 个多余的标签页")
+            pages = pages[:1]
         page = pages[0] if pages else await ctx.new_page()
         hook = getattr(self, "on_page_ready", None)
         if hook is not None:
@@ -831,11 +927,18 @@ class DouyinBrowser:
             self._session_checked_at = time.time()
             self._last_keepalive = self._session_checked_at   # 复核也算一次保活
         except Exception as exc:  # noqa: BLE001
-            logger.warning("登录态复核失败（按未登录处理）：%s", exc)
-            return False
+            # 页面炸了不等于掉登录：cookie 还在、sid_guard 也没到期时，
+            # 上游会拿到「未知」，别据此叫人扫码（那会把浏览器开成一堆）。
+            self._login_unknown = True
+            logger.warning(f"登录态核对不了（{type(exc).__name__}），先按未知处理")
+            return bool(getattr(self, "_last_login_ok", False))
         if isinstance(who, dict) and who.get("code") == 0 and who.get("nick"):
             self._who = who
+            self._last_login_ok = True
+            self._login_unknown = False
             return True
+        self._last_login_ok = False
+        self._login_unknown = False
         return False
 
     async def whoami(self) -> dict:
